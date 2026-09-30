@@ -199,7 +199,24 @@ def test_the_ridge_follows_the_cache_dtype_not_the_compute_dtype() -> None:
 def test_pprint_carries_the_geometry_so_a_run_is_reproducible_from_its_config() -> None:
     # A field that does not print cannot be overridden, forked, or diffed, and
     # the run stops being reproducible from the config that produced it.
-    printed = mha_cache().finalize().pformat()
-    assert "num_layers" in printed
-    assert "num_heads_kv" in printed
-    assert "weight_bytes" in printed
+    # Defaults are hidden by default, so the full tree is what has to carry
+    # every field -- and a fork that SETS weight_bytes must surface it.
+    printed = mha_cache().finalize().pformat(hide_default_values=False)
+    for field in (
+        "num_layers",
+        "num_heads_kv",
+        "channels_head",
+        "weight_bytes",
+        "dtype",
+    ):
+        assert field in printed
+    forked = mha_cache(weight_bytes=1 << 10).finalize().pformat()
+    assert "weight_bytes" in forked
+
+
+def test_finalize_propagates_through_the_real_configgle_chain() -> None:
+    # finalize() here delegates to super(), so what matters is that the
+    # inference runs on the real Fig rather than only under a stand-in: the
+    # sentinel must be resolved by the time the config is printed.
+    printed = KVCache(num_layers=2, num_heads=3, channels_head=4).finalize().pformat()
+    assert "num_heads_kv=3" in printed
