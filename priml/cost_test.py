@@ -593,12 +593,16 @@ def test_peak_intensity_is_the_ridge() -> None:
 def test_peak_names_a_form_factor_without_moving_the_bare_name() -> None:
     # A bare name keeps meaning the form factor the table was sourced from, so
     # every recorded result is unchanged by the form-factor entries existing.
-    assert peak()["a100", BF, "bytes", "matmul"] == 2.039e12
-    assert peak()["h100", BF, "bytes", "matmul"] == 3.35e12
+    # Compared with approx rather than equality: 2.039e12 is not exactly
+    # representable, so `==` here would be testing the float format, not the
+    # table. The cross-form comparisons are exact-equality safe because both
+    # sides read the same stored literal.
+    assert peak()["a100", BF, "bytes", "matmul"] == pytest.approx(2.039e12)
+    assert peak()["h100", BF, "bytes", "matmul"] == pytest.approx(3.35e12)
     # The PCIe boards move less memory, and compute is identical across forms.
-    assert peak()["a100-40g", BF, "bytes", "matmul"] == 1.555e12
-    assert peak()["a100-80g-pcie", BF, "bytes", "matmul"] == 1.555e12
-    assert peak()["h100-pcie", BF, "bytes", "matmul"] == 2.0e12
+    assert peak()["a100-40g", BF, "bytes", "matmul"] == pytest.approx(1.555e12)
+    assert peak()["a100-80g-pcie", BF, "bytes", "matmul"] == pytest.approx(1.555e12)
+    assert peak()["h100-pcie", BF, "bytes", "matmul"] == pytest.approx(2.0e12)
     assert (
         peak()["a100-40g", BF, "flops", "matmul"]
         == peak()["a100", BF, "flops", "matmul"]
