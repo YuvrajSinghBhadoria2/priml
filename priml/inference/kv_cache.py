@@ -230,7 +230,7 @@ class KVCache(Fig["KVCache"]):
             batch_size=batch_size, context_len=context_len
         )
         ridge_dtype = resolve_dtype(self.dtype if dtype is None else dtype)
-        ridge = float(peak()[device][ridge_dtype, "intensity", "matmul"])
+        ridge = peak()[device, ridge_dtype, "intensity", "matmul"]
         total_bytes = kv_bytes + self.weight_bytes
         return DecodeCost(
             flops=flops,
