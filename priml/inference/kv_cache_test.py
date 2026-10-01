@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from typing import Final
 
+from configgle.testing import assert_pprint_golden
 from torch.utils.flop_counter import FlopCounterMode
 
 import pytest
 import torch
 
 from priml.cost import peak
-from priml.inference.kv_cache import KVCache
+from priml.inference.kv_cache import KVCacheGeometry
 
 
 NUM_LAYERS: Final = 3
@@ -28,8 +29,8 @@ def kv_cache(
     *,
     num_heads_kv: int = NUM_HEADS_KV,
     dtype: torch.dtype = BF16,
-) -> KVCache:
-    return KVCache(
+) -> KVCacheGeometry:
+    return KVCacheGeometry(
         num_layers=NUM_LAYERS,
         num_heads=NUM_HEADS,
         num_heads_kv=num_heads_kv,
@@ -59,10 +60,10 @@ def test_tokens_in_is_the_floor_of_the_budget_over_the_token_cost() -> None:
 @pytest.mark.parametrize(
     "cache",
     [
-        KVCache(),
+        KVCacheGeometry(),
         # Two unset sentinels multiply to a positive count.
-        KVCache(channels_head=CHANNELS_HEAD, num_heads_kv=NUM_HEADS_KV),
-        KVCache(
+        KVCacheGeometry(channels_head=CHANNELS_HEAD, num_heads_kv=NUM_HEADS_KV),
+        KVCacheGeometry(
             num_layers=NUM_LAYERS,
             num_heads=3,
             num_heads_kv=2,
@@ -71,7 +72,7 @@ def test_tokens_in_is_the_floor_of_the_budget_over_the_token_cost() -> None:
     ],
     ids=["unset", "partly-set", "indivisible-heads"],
 )
-def test_an_invalid_geometry_raises_rather_than_pricing(cache: KVCache) -> None:
+def test_an_invalid_geometry_raises_rather_than_pricing(cache: KVCacheGeometry) -> None:
     with pytest.raises(ValueError, match="num_"):
         cache.tokens_in(1 << 20)
     with pytest.raises(ValueError, match="num_"):
@@ -82,11 +83,13 @@ def test_an_invalid_geometry_raises_rather_than_pricing(cache: KVCache) -> None:
 def test_attention_flops_match_what_torch_counts_for_a_decode_step(
     num_heads_kv: int,
 ) -> None:
-    batch_size, context_len = 2, 7
+    batch_size, context_len = 3, 7
     group = NUM_HEADS // num_heads_kv
+    # One query row: a decode step emits a single token.
     q = torch.zeros(batch_size, NUM_HEADS, 1, CHANNELS_HEAD)
-    k = torch.zeros(batch_size, num_heads_kv, context_len, CHANNELS_HEAD)
-    v = torch.zeros(batch_size, num_heads_kv, context_len, CHANNELS_HEAD)
+    # The new token's keys join the cache before it attends, so T + 1 keys.
+    k = torch.zeros(batch_size, num_heads_kv, context_len + 1, CHANNELS_HEAD)
+    v = torch.zeros(batch_size, num_heads_kv, context_len + 1, CHANNELS_HEAD)
     with FlopCounterMode(display=False) as counter:
         scores = q @ k.repeat_interleave(group, dim=1).transpose(-1, -2)
         _ = scores.softmax(-1) @ v.repeat_interleave(group, dim=1)
@@ -115,9 +118,8 @@ def test_cache_intensity_is_twice_the_grouping_ratio_over_itemsize(
             device="h100",
             dtype=BF16,
         )
-        # The step also writes the new token, hence T / (T + 1).
         assert cost.intensity == pytest.approx(
-            2 * cache.grouping_ratio / dtype.itemsize * context_len / (context_len + 1),
+            2 * cache.grouping_ratio / dtype.itemsize,
         )
 
 
@@ -204,16 +206,12 @@ def test_an_invalid_step_raises_rather_than_pricing(
         )
 
 
-def test_pformat_carries_the_geometry() -> None:
-    printed = kv_cache().finalize().pformat(hide_default_values=False)
-    for field in (
-        "num_layers",
-        "num_heads",
-        "num_heads_kv",
-        "channels_head",
-        "dtype",
-    ):
-        assert field in printed
+def test_kv_cache_geometry_config_pprint() -> None:
+    assert_pprint_golden(
+        test_file=__file__,
+        name="kv_cache_geometry",
+        config=kv_cache(),
+    )
 
 
 if __name__ == "__main__":

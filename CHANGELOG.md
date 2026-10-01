@@ -7,8 +7,8 @@ All notable priml changes are documented here. This project follows
 
 ### Added
 
-- `priml.inference.kv_cache`: `KVCache` prices a KV cache's bytes per token
-  and one decode step's FLOPs and traffic against a device ridge from
+- `priml.inference.kv_cache`: `KVCacheGeometry` prices a KV cache's bytes per
+  token and one decode step's FLOPs and traffic against a device ridge from
   `priml.cost`, including grouped-query attention and the weight read.
 
 ### Fixed

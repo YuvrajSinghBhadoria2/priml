@@ -1,17 +1,17 @@
 """Analytical cost of one decode step, read from a KV-cache geometry.
 
 A decode step at context ``T`` reads every cached token, writes the new one's
-keys and values, and runs two matmuls per query head against the cache
-(``q @ K^T`` and ``p @ V``). Over ``L`` layers, ``B`` sequences, ``H`` query
-heads, ``Hkv`` key/value heads, and head width ``D``:
+keys and values, and runs two matmuls per query head over all ``T + 1`` keys,
+its own included (``q @ K^T`` and ``p @ V``). Over ``L`` layers, ``B``
+sequences, ``H`` query heads, ``Hkv`` key/value heads, and head width ``D``:
 
-    flops = 4 * L * B * T * H * D
+    flops = 4 * L * B * (T + 1) * H * D
     bytes = 2 * L * B * (T + 1) * Hkv * D * itemsize
 
-As ``T`` grows the ratio approaches ``2 * (H / Hkv) / itemsize``, independent
-of context: 1 FLOP/byte for multi-head attention at bfloat16, about 295x below
-an H100's ridge. Grouped-query attention raises it by exactly the grouping
-ratio and a narrower cache by the itemsize it saves; nothing else does.
+The ratio is ``2 * (H / Hkv) / itemsize`` at every context: 1 FLOP/byte for
+multi-head attention at bfloat16, about 295x below an H100's ridge.
+Grouped-query attention raises it by exactly the grouping ratio and a narrower
+cache by the itemsize it saves; nothing else does.
 
 Reading ``P`` parameters once per step adds ``2 * B * P`` FLOPs over
 ``P * itemsize`` bytes at the compute dtype, intensity ``2 * B / itemsize``.
@@ -35,7 +35,7 @@ import torch
 from priml.cost import Device, peak, resolve_dtype
 
 
-__all__ = ["DecodeCost", "KVCache"]
+__all__ = ["DecodeCost", "KVCacheGeometry"]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -70,7 +70,7 @@ class DecodeCost:
         return self.intensity / self.ridge
 
 
-class KVCache(Fig["KVCache"]):
+class KVCacheGeometry(Fig["KVCacheGeometry"]):
     """The geometry of a KV cache, and what one decode step costs against it.
 
     Every count defaults to -1, unset; pricing an unset or inconsistent
@@ -158,7 +158,7 @@ class KVCache(Fig["KVCache"]):
             4
             * self.num_layers
             * batch_size
-            * context_len
+            * (context_len + 1)
             * self.num_heads
             * self.channels_head
         )
