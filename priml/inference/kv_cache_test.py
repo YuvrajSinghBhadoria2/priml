@@ -28,17 +28,21 @@ ITEMSIZE_BF16: Final = 2
 ITEMSIZE_INT8: Final = 1
 
 
-def mha_cache(**kw: object) -> KVCache:
+def mha_cache(
+    *,
+    num_heads_kv: int = NUM_HEADS,
+    weight_bytes: int = 0,
+    dtype: torch.dtype = torch.bfloat16,
+) -> KVCache:
     """Build a plain multi-head cache: every query head has its own KV head."""
-    defaults = {
-        "num_layers": NUM_LAYERS,
-        "num_heads": NUM_HEADS,
-        "num_heads_kv": NUM_HEADS,
-        "channels_head": CHANNELS_HEAD,
-        "dtype": torch.bfloat16,
-    }
-    defaults.update(kw)
-    return KVCache(**defaults)
+    return KVCache(
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS,
+        num_heads_kv=num_heads_kv,
+        channels_head=CHANNELS_HEAD,
+        dtype=dtype,
+        weight_bytes=weight_bytes,
+    )
 
 
 def test_bytes_per_token_counts_keys_and_values_across_layers() -> None:
