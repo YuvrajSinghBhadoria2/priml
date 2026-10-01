@@ -5,6 +5,12 @@ All notable priml changes are documented here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Cropped JPEG decodes find libturbojpeg where `TurboJPEG()` does. The
+  region decoder only asked `find_library`, which misses a Homebrew install
+  on Apple Silicon, so every crop there decoded to `None`.
+
 ## 0.1.4 - 2026-08-19
 
 ### Changed
