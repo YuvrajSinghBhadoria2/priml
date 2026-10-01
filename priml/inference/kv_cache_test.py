@@ -65,7 +65,9 @@ def test_grouped_query_shrinks_the_cache_by_exactly_the_grouping_ratio() -> None
 
 def test_finalize_mirrors_the_query_head_count_onto_the_kv_count() -> None:
     cache = KVCache(
-        num_layers=NUM_LAYERS, num_heads=NUM_HEADS, channels_head=CHANNELS_HEAD
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS,
+        channels_head=CHANNELS_HEAD,
     )
     assert cache.finalize().num_heads_kv == NUM_HEADS
 
@@ -124,7 +126,9 @@ def test_decode_is_memory_bound_at_every_context_length_on_every_device() -> Non
     for device in ("a100", "h100", "b200", "rtx5090"):
         for context_len in (2, 64, 4096):
             cost = cache.decode_cost(
-                batch_size=2, context_len=context_len, device=device
+                batch_size=2,
+                context_len=context_len,
+                device=device,
             )
             assert cost.memory_bound, f"{device} at {context_len}"
             assert cost.fraction_of_ridge < 0.01
@@ -164,7 +168,8 @@ def test_the_weight_read_is_paid_once_per_step_whatever_the_context() -> None:
     # And it is the same limit from either side: doubling the weights at a
     # context that already dominates them barely moves the intensity.
     heavier = mha_cache(weight_bytes=2 * weights).decode_cost(
-        batch_size=2, context_len=4096
+        batch_size=2,
+        context_len=4096,
     )
     assert heavier.intensity == pytest.approx(cache_only.intensity, rel=0.01)
 
@@ -174,7 +179,7 @@ def test_the_ridge_is_read_from_priml_cost_and_not_restated() -> None:
     # device, and every memory-bound verdict in it becomes wrong.
     cost = mha_cache().decode_cost(batch_size=2, context_len=8, device="h100")
     assert cost.ridge == pytest.approx(
-        peak()["h100"][torch.bfloat16, "intensity", "matmul"]
+        peak()["h100"][torch.bfloat16, "intensity", "matmul"],
     )
 
 
@@ -192,10 +197,16 @@ def test_the_ridge_follows_the_cache_dtype_not_the_compute_dtype() -> None:
     # A low-bit cache experiment changes which ceiling it is measured against,
     # so asking for the ridge at another dtype has to actually do something.
     narrow = mha_cache(dtype=torch.float8_e4m3fn).decode_cost(
-        batch_size=2, context_len=8, device="b200", dtype=torch.float8_e4m3fn
+        batch_size=2,
+        context_len=8,
+        device="b200",
+        dtype=torch.float8_e4m3fn,
     )
     wide = mha_cache(dtype=torch.bfloat16).decode_cost(
-        batch_size=2, context_len=8, device="b200", dtype=torch.bfloat16
+        batch_size=2,
+        context_len=8,
+        device="b200",
+        dtype=torch.bfloat16,
     )
     assert narrow.ridge == pytest.approx(2 * wide.ridge)
 

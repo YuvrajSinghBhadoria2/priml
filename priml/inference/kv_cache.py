@@ -227,7 +227,8 @@ class KVCache(Fig["KVCache"]):
 
         """
         flops, kv_bytes, weight_flops = self._step_flops_and_bytes(
-            batch_size=batch_size, context_len=context_len
+            batch_size=batch_size,
+            context_len=context_len,
         )
         ridge_dtype = resolve_dtype(self.dtype if dtype is None else dtype)
         ridge = peak()[device, ridge_dtype, "intensity", "matmul"]
@@ -244,7 +245,10 @@ class KVCache(Fig["KVCache"]):
         )
 
     def _step_flops_and_bytes(
-        self, *, batch_size: int, context_len: int
+        self,
+        *,
+        batch_size: int,
+        context_len: int,
     ) -> tuple[int, int, int]:
         """Return the step's ``(flops, kv_bytes, weight_flops)``.
 
