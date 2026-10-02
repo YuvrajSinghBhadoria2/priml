@@ -503,7 +503,11 @@ def test_multi_head_attention_is_unchanged_by_the_kv_count() -> None:
     # existing caller sees a different number.
     for head in (2, 4, 8):
         default = attention_kernel_cost(
-            seq_len=16, dtype=torch.bfloat16, num_heads=head, channels_head=8, rows=1
+            seq_len=16,
+            dtype=torch.bfloat16,
+            num_heads=head,
+            channels_head=8,
+            rows=1,
         )
         explicit = attention_kernel_cost(
             seq_len=16,
@@ -519,7 +523,7 @@ def test_multi_head_attention_is_unchanged_by_the_kv_count() -> None:
 def test_the_gqa_saving_scales_with_the_grouping_ratio() -> None:
     # Llama-3-8B shares K/V across 32 query heads in groups of 8, so its KV
     # reads are a quarter of what a per-query-head count would charge.
-    saved = []
+    saved: list[int] = []
     for kv_head in (8, 16, 32):
         cost = attention_kernel_cost(
             seq_len=32,
@@ -533,7 +537,11 @@ def test_the_gqa_saving_scales_with_the_grouping_ratio() -> None:
     assert saved[0] < saved[1] < saved[2]
     # Bytes fall as the reads are shared further; FLOPs never do.
     dense = attention_kernel_cost(
-        seq_len=32, dtype=torch.bfloat16, num_heads=32, channels_head=16, rows=1
+        seq_len=32,
+        dtype=torch.bfloat16,
+        num_heads=32,
+        channels_head=16,
+        rows=1,
     )
     assert saved[-1] == dense["bytes", "primal", "matmul"].sum()
 

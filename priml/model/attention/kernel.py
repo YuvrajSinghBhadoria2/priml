@@ -75,6 +75,7 @@ def attention_kernel_cost(
         weight=False,
         rows=sequence_rows,
         dtype=dt,
+        operand_read=False,
     ).tile(batch_size)
     values = matmul_cost(
         channels_in=keys,
@@ -82,6 +83,7 @@ def attention_kernel_cost(
         weight=False,
         rows=sequence_rows,
         dtype=dt,
+        operand_read=False,
     ).tile(batch_size)
     # Logical unfused I/O, including scores, even when execution uses fused SDPA.
     # Scale/subtract/exp/divide read two row scalars; VJP reads one row sum.
@@ -113,25 +115,26 @@ def attention_kernel_cost(
         rows=query_rows,
         dtype=dt,
     )
-    # ``matmul_cost`` prices its right operand as ``itemsize * channels_in *
-    # channels_out``, so ``scores`` carries the K read and ``values`` carries
-    # the V read, both at ONE head's multiplicity. Grouped-query attention
-    # shares those tensors across the query heads in a group, so they have to
-    # come out of the per-head tiling and go back in once per KV head. The
-    # arithmetic stays per query head: each one really does run its own two
-    # products over the whole context.
+    # Grouped-query attention shares K and V across the query heads in a
+    # group, so those operand reads happen once per KV head rather than once
+    # per query head -- charging them per query head overstates them by
+    # num_heads / num_heads_kv. The two products below therefore leave the
+    # operand read out and the read is added back on its own, at the KV head
+    # count. The arithmetic stays per query head: each one really does run its
+    # own two products over the whole context, so FLOPs never move.
     #
-    # The adjoint reads the same operands and writes the operand gradients, so
-    # it moves twice the primal operand traffic -- the same factor
-    # ``matmul_cost`` applies to its own ``adjoint`` cell.
+    # The same read the per-head products left out, rebuilt as plain operand
+    # traffic. The adjoint moves twice the primal, matching matmul_cost's own
+    # adjoint cell.
     kv_elements = channels_head * keys + keys * value_width
-    kv_read = traffic("primal", "matmul", elements=kv_elements, dtype=dt) + traffic(
-        "adjoint", "matmul", elements=2 * kv_elements, dtype=dt
-    )
-    per_head = (scores + values + softmax + dropout) - kv_read
+    kv_read = (
+        traffic("primal", "matmul", elements=kv_elements, dtype=dt)
+        + traffic("adjoint", "matmul", elements=2 * kv_elements, dtype=dt)
+    ).tile(batch_size)
+    per_head = (scores + values + softmax + dropout).tile(num_heads, copies=num_heads)
     if num_heads_kv <= 0 or num_heads_kv == num_heads:
-        return per_head.tile(num_heads, copies=num_heads) + kv_read.tile(num_heads)
-    return per_head.tile(num_heads, copies=num_heads) + kv_read.tile(num_heads_kv)
+        return per_head + kv_read.tile(num_heads)
+    return per_head + kv_read.tile(num_heads_kv)
 
 
 class SdpaFused(nn.Module):
