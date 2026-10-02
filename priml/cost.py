@@ -273,6 +273,27 @@ class Cost:
             bytes_state=self.bytes_state + other.bytes_state,
         )
 
+    def __sub__(self, other: Cost) -> Cost:
+        """Subtract another ledger cellwise, so shared traffic can be re-multiplied.
+
+        A tiled cost counts everything at the tiling multiplicity, which is
+        right for work every repetition performs and wrong for operands that
+        repetitions SHARE. Grouped-query attention reads K/V once per KV head
+        while every query head does its own arithmetic, so the KV read has to
+        come out of the per-head tiling and go back in at the KV-head count.
+        That is a subtraction followed by an addition, and a ledger that
+        supports composition and repetition should support the difference too.
+        """
+        merged = dict(self.cells)
+        for key, value in other.cells.items():
+            merged[key] = merged.get(key, 0) - value
+        return Cost(
+            cells=merged,
+            params=self.params - other.params,
+            params_active=self.params_active - other.params_active,
+            bytes_state=self.bytes_state - other.bytes_state,
+        )
+
     def tile(self, repetitions: int, *, copies: int = 1) -> Cost:
         """Repeat an invocation an integer number of times.
 

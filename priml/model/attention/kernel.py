@@ -28,6 +28,7 @@ def attention_kernel_cost(
     num_heads: int,
     channels_head: int,
     channels_v_head: int = -1,
+    num_heads_kv: int = -1,
     window: int = -1,
     dropout_p: float = 0.0,
     rows: int = -1,
@@ -46,6 +47,9 @@ def attention_kernel_cost(
       batch_size: Sequences in this invocation.
       dtype: Activation dtype; ``None`` is torch's default.
       num_heads: Query heads.
+      num_heads_kv: Key/value heads; ``-1`` mirrors ``num_heads``. A smaller
+        count is Grouped-Query Attention, where several query heads share one
+        key and value head.
       channels_head: Width of each query/key head.
       channels_v_head: Value width; -1 uses the query/key width.
       window: Previous keys each query reaches, plus itself; negative is unbounded.
@@ -109,7 +113,25 @@ def attention_kernel_cost(
         rows=query_rows,
         dtype=dt,
     )
-    return (scores + values + softmax + dropout).tile(num_heads, copies=num_heads)
+    # ``matmul_cost`` prices its right operand as ``itemsize * channels_in *
+    # channels_out``, so ``scores`` carries the K read and ``values`` carries
+    # the V read, both at ONE head's multiplicity. Grouped-query attention
+    # shares those tensors across the query heads in a group, so they have to
+    # come out of the per-head tiling and go back in once per KV head. The
+    # arithmetic stays per query head: each one really does run its own two
+    # products over the whole context.
+    #
+    # The adjoint reads the same operands and writes the operand gradients, so
+    # it moves twice the primal operand traffic -- the same factor
+    # ``matmul_cost`` applies to its own ``adjoint`` cell.
+    kv_elements = channels_head * keys + keys * value_width
+    kv_read = traffic("primal", "matmul", elements=kv_elements, dtype=dt) + traffic(
+        "adjoint", "matmul", elements=2 * kv_elements, dtype=dt
+    )
+    per_head = (scores + values + softmax + dropout) - kv_read
+    if num_heads_kv <= 0 or num_heads_kv == num_heads:
+        return per_head.tile(num_heads, copies=num_heads) + kv_read.tile(num_heads)
+    return per_head.tile(num_heads, copies=num_heads) + kv_read.tile(num_heads_kv)
 
 
 class SdpaFused(nn.Module):
