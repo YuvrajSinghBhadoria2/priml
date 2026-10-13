@@ -433,8 +433,15 @@ def nbytes(elements: int, dtype: torch.dtype | None) -> int:
     """Return the bytes ``elements`` values of ``dtype`` occupy.
 
     ``torch.float4_e2m1fn_x2`` packs two values into its one-byte element, so
-    ``itemsize`` alone counts fp4 at twice its size. A partial element still
-    occupies a whole one.
+    ``itemsize`` alone counts fp4 at twice its size.
+
+    Args:
+      elements: Values stored, not storage elements.
+      dtype: Storage dtype; ``None`` is torch's default.
+
+    Returns:
+      nbytes: Whole storage elements' bytes; a partial element takes a whole one.
+
     """
     dt = resolve_dtype(dtype)
     per_element = 2 if dt == torch.float4_e2m1fn_x2 else 1
