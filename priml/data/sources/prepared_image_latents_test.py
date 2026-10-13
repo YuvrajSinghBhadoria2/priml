@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING
 import json
 
 from PIL import Image
+from treekle import ReadError
 
 import numpy as np
 import pytest
 
 from priml.data.sources.prepared_image_latents import read_image, read_labels
-from priml.lib.custom_json import ReadError
 
 
 if TYPE_CHECKING:
@@ -76,6 +76,6 @@ def test_read_image_rejects_invalid_numpy_metadata(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

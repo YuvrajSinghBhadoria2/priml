@@ -13,6 +13,7 @@ import tempfile
 
 from pyarrow import Table, parquet
 from tokenizers import AddedToken, Tokenizer, normalizers, processors
+from treekle import PlainTree, ReadError
 
 import numpy as np
 import pytest
@@ -34,7 +35,6 @@ from priml.baselines.nanochat.scripts.prepare_tokenizer import (
     usage_scores,
     write_mapping,
 )
-from priml.lib.custom_json import JSONValue, ReadError
 
 
 def test_mapping_stages_in_destination_directory(
@@ -59,7 +59,7 @@ def test_mapping_stages_in_destination_directory(
 
 def test_mapping_io_and_usage_scores(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "deeper" / "mapping.json"
-    value: JSONValue = {"z": 1, "a": [True, None]}
+    value: PlainTree = {"z": 1, "a": [True, None]}
     write_mapping(path, value=value)
     write_mapping(path, value=value)
     assert path.read_text() == '{\n  "a": [\n    true,\n    null\n  ],\n  "z": 1\n}\n'
@@ -85,13 +85,13 @@ def test_mapping_io_and_usage_scores(tmp_path: Path) -> None:
     # serializing ..." notes Python 3.14's encoder adds, and 3.12, where the public
     # package runs, adds none.
     circular = "Circular reference detected"
-    recursive_value: list[JSONValue] = []
+    recursive_value: list[PlainTree] = []
     recursive_value.append(recursive_value)
     with pytest.raises(ValueError, match=f"^{circular}") as recursive_list:
         write_mapping(path, value={"recursive": recursive_value})
     assert str(recursive_list.value) == circular
 
-    recursive_mapping: dict[str, JSONValue] = {}
+    recursive_mapping: dict[str, PlainTree] = {}
     recursive_mapping["recursive"] = recursive_mapping
     with pytest.raises(ValueError, match=f"^{circular}") as recursive_dict:
         write_mapping(path, value=recursive_mapping)
@@ -864,6 +864,6 @@ def test_encode_batch_uses_literal_backend_settings_and_rejects_bad_bytes(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -16,6 +16,7 @@ import os
 import sys
 
 from torch import nn
+from treekle import ReadError
 
 import pytest
 import torch
@@ -28,7 +29,6 @@ from priml.hub import (
     load_transformers_model,
     resolve_hf_dtype,
 )
-from priml.lib.custom_json import ReadError
 from priml.lib.userdirs import cache_dir
 
 
@@ -552,7 +552,7 @@ def test_load_torch_hub_distributed_rank_zero_broadcasts_success() -> None:
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_called_once_with([None], src=0)
 
 
@@ -569,7 +569,7 @@ def test_load_torch_hub_distributed_nonzero_rank_loads_after_broadcast() -> None
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_called_once_with([None], src=0)
 
 
@@ -591,8 +591,34 @@ def test_torch_hub_distributed_loads_directly_without_process_group(
         result = hub.load_torch_hub_distributed("owner/repo", "entry")
 
     assert result is model
-    load.assert_called_once_with("owner/repo", "entry")
+    load.assert_called_once_with("owner/repo", "entry", skip_validation=False)
     broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("initialized", "rank"),
+    [(False, 0), (True, 0), (True, 1)],
+)
+def test_load_torch_hub_distributed_forwards_skip_validation(
+    initialized: bool,
+    rank: int,
+) -> None:
+    model = nn.Linear(2, 3)
+    with (
+        patch("torch.distributed.is_available", return_value=True),
+        patch("torch.distributed.is_initialized", return_value=initialized),
+        patch("torch.distributed.get_rank", return_value=rank),
+        patch("torch.distributed.broadcast_object_list"),
+        patch("torch.hub.load", return_value=model) as load,
+    ):
+        result = hub.load_torch_hub_distributed(
+            "owner/repo:0123abc",
+            "entry",
+            skip_validation=True,
+        )
+
+    assert result is model
+    load.assert_called_once_with("owner/repo:0123abc", "entry", skip_validation=True)
 
 
 def test_load_torch_hub_distributed_broadcasts_remote_failure() -> None:
@@ -703,6 +729,6 @@ def test_load_transformers_model_fallback_keeps_caller_options() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

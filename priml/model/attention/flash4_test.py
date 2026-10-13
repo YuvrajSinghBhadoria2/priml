@@ -41,6 +41,7 @@ CU_SEQLENS: Final = (0, 3, 7, 8, 8, 8, 12, 16)
 FA4_WARNINGS: Final = pytest.mark.filterwarnings(
     "ignore::DeprecationWarning:flash_attn",
     "ignore::DeprecationWarning:cutlass",
+    "ignore::DeprecationWarning:quack",
     "ignore::UserWarning:cutlass",
 )
 """What a real FA4 run warns from its own and CUTLASS's code, not this repo's.
@@ -783,6 +784,6 @@ def _opaque_segment_attention(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -17,16 +17,25 @@ import time
 from configgle import Fig
 from tokenizers import Tokenizer, pre_tokenizers
 from torch import Tensor
+from treekle import json_loads
 
 import numpy as np
 import pytest
 import torch
 
 from priml.baselines.convextok.export import export_tokenizer
-from priml.baselines.convextok.measure import MAXRSS_UNIT_BYTES, MeasuredFit
+from priml.baselines.convextok.measure import (
+    MAXRSS_UNIT_BYTES,
+    MeasuredFit,
+    Metrics,
+)
 from priml.baselines.convextok.prepare_test import fixture_config
 from priml.baselines.convextok.program import LinearProgram
-from priml.lib.custom_json import convert, parse
+from priml.baselines.convextok.testing import (
+    TESTDATA,
+    Pretokens,
+    Vocab,
+)
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -41,10 +50,10 @@ def test_fixture_fit_saves_upstream_vocabulary_and_measures_it(tmp_path: Path) -
 
     run_dir = tmp_path / "runs/convextok/exp000"
     vocabulary = set(Tokenizer.from_file(str(run_dir / "tokenizer.json")).get_vocab())
-    golden = set(convert(_read_json("vocab.json").get("det"), list[str]))
+    golden = set(json_loads((TESTDATA / "vocab.json").read_text(), Vocab)["det"])
     assert vocabulary == golden | set(pre_tokenizers.ByteLevel.alphabet())
-    metrics = _read_metrics(run_dir)
-    seconds = convert(metrics.get("seconds"), dict[str, float])
+    metrics = json_loads((run_dir / "metrics.json").read_text(), Metrics)
+    seconds = metrics["seconds"]
     assert list(seconds) == [
         "read",
         "pretokens",
@@ -68,19 +77,18 @@ def test_fixture_fit_saves_upstream_vocabulary_and_measures_it(tmp_path: Path) -
         token_edges, byte_edges, tokens = (
             int(size) for size in torch.from_numpy(program["sizes"])
         )
-    built = convert(metrics.get("program"), dict[str, int])
+    built = metrics["program"]
     assert built == {
         "rows": vertices + token_edges + 1,
         "columns": columns,
         "nonzeros": 4 * token_edges + 2 * byte_edges + tokens,
     }
-    solved = convert(metrics.get("solved"), dict[str, int])
-    assert solved["columns"] < built["columns"]
+    assert metrics["solved"]["columns"] < built["columns"]
     assert metrics.get("optimal") is True
-    assert convert(metrics.get("iterations"), int) > 0
-    assert metrics.get("peak_gpu_bytes") is None
-    assert convert(metrics.get("peak_host_bytes"), int) > 0
-    assert metrics.get("pieces") == len(vocabulary)
+    assert metrics.get("iterations", 0) > 0
+    assert metrics["peak_gpu_bytes"] is None
+    assert metrics["peak_host_bytes"] > 0
+    assert metrics["pieces"] == len(vocabulary)
     assert "missing" not in metrics
 
 
@@ -89,7 +97,7 @@ def test_known_solution_pins_objective_infeasibility_and_diff(tmp_path: Path) ->
     config = _measured_config(tmp_path)
     reference = tmp_path / "reference.json"
     learned = sorted(
-        set(convert(_read_json("vocab.json").get("det"), list[str]))
+        set(json_loads((TESTDATA / "vocab.json").read_text(), Vocab)["det"])
         - set(pre_tokenizers.ByteLevel.alphabet()),
     )
     export_tokenizer(
@@ -98,12 +106,15 @@ def test_known_solution_pins_objective_infeasibility_and_diff(tmp_path: Path) ->
     ).save(str(reference))
     config.preparation.presolve = None
     config.preparation.solver = _Zeros.Config()
-    config.reference = reference
+    config.reference = Path("/reference.json")
     config.make().run()
 
-    metrics = _read_metrics(tmp_path / "runs/convextok/exp000")
+    metrics = json_loads(
+        (tmp_path / "runs/convextok/exp000/metrics.json").read_text(),
+        Metrics,
+    )
     num_pretokens = len(
-        convert(_read_json("pretokens.json").get("pretokens"), list[str]),
+        json_loads((TESTDATA / "pretokens.json").read_text(), Pretokens)["pretokens"],
     )
     assert metrics.get("objective") == 0.0
     # A unit of flow leaves each pretoken's first vertex and enters its last, so the
@@ -129,9 +140,9 @@ def test_run_writes_stage_seconds_memory_and_tokenizer(tmp_path: Path) -> None:
 
     run_dir = tmp_path / "runs/convextok/exp000"
     text = (run_dir / "metrics.json").read_text()
-    metrics = parse(text, dict[str, object])
+    metrics = json_loads((run_dir / "metrics.json").read_text(), Metrics)
     assert text == json.dumps(metrics, indent=2) + "\n"
-    seconds = convert(metrics["seconds"], dict[str, float])
+    seconds = metrics["seconds"]
     assert list(seconds) == [
         "read",
         "pretokens",
@@ -147,7 +158,7 @@ def test_run_writes_stage_seconds_memory_and_tokenizer(tmp_path: Path) -> None:
         value for stage, value in seconds.items() if stage != "total"
     )
     assert metrics["peak_gpu_bytes"] is None
-    assert before <= convert(metrics["peak_host_bytes"], int) <= after
+    assert before <= metrics["peak_host_bytes"] <= after
     tokenizer = Tokenizer.from_file(str(run_dir / "tokenizer.json"))
     assert tokenizer.get_vocab_size() == 256
 
@@ -159,7 +170,10 @@ def test_solution_is_measured_against_the_program_as_built(tmp_path: Path) -> No
     config.preparation.solver = _Ramp.Config()
     config.make().run()
 
-    metrics = _read_metrics(tmp_path / "runs/convextok/exp000")
+    metrics = json_loads(
+        (tmp_path / "runs/convextok/exp000/metrics.json").read_text(),
+        Metrics,
+    )
     with _npz("program.npz") as golden:
         rows_eq = int(torch.from_numpy(golden["A_eq_shape"])[0])
         c, lb, ub, b_eq, b_ub = (
@@ -212,8 +226,12 @@ def test_cuda_fit_reports_peak_device_memory(tmp_path: Path) -> None:
     config.preparation.solver = _Zeros.Config()
     config.make().run()
 
-    metrics = _read_metrics(tmp_path / "runs/convextok/exp000")
-    assert convert(metrics["peak_gpu_bytes"], int) > 0
+    peak = json_loads(
+        (tmp_path / "runs/convextok/exp000/metrics.json").read_text(),
+        Metrics,
+    )["peak_gpu_bytes"]
+    assert peak is not None
+    assert peak > 0
 
 
 def test_existing_run_directory_fails_before_fitting(tmp_path: Path) -> None:
@@ -237,6 +255,15 @@ def test_run_directory_comes_from_study_and_experiment(tmp_path: Path) -> None:
     assert finalized.preparation.working_dir == finalized.working_dir
 
 
+def test_inputs_resolve_beneath_base_dir(tmp_path: Path) -> None:
+    config = MeasuredFit.Config()
+    config.base_dir = tmp_path
+    config.reference = Path("/runs/convextok/exp000/tokenizer.json")
+    finalized = config.copy_tree().finalize()
+    assert finalized.preparation.raw_dir == tmp_path / "datasets/nanochat/raw"
+    assert finalized.reference == tmp_path / "runs/convextok/exp000/tokenizer.json"
+
+
 def _measured_config(tmp_path: Path) -> MeasuredFit.Config:
     """Point a CPU measured fit at the fixture corpus, written as one raw shard."""
     config = MeasuredFit.Config()
@@ -244,21 +271,15 @@ def _measured_config(tmp_path: Path) -> MeasuredFit.Config:
     config.experiment_name = "exp000"
     config.base_dir = tmp_path
     config.preparation = fixture_config(tmp_path)
+    # Logical, as a measured fit's inputs are: it resolves beneath base_dir.
+    config.preparation.raw_dir = Path("/raw")
     return config
-
-
-def _read_metrics(run_dir: Path) -> dict[str, object]:
-    return parse((run_dir / "metrics.json").read_text(), dict[str, object])
 
 
 def _npz(name: str) -> np.lib.npyio.NpzFile:
     loaded = cast(object, np.load(_CWD / "testdata" / name))
     assert isinstance(loaded, np.lib.npyio.NpzFile)
     return loaded
-
-
-def _read_json(name: str) -> dict[str, object]:
-    return parse((_CWD / "testdata" / name).read_text(), dict[str, object])
 
 
 def _golden_matrix(
@@ -329,6 +350,6 @@ class _Ramp:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

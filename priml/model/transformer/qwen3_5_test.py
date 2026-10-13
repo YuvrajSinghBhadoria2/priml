@@ -10,11 +10,11 @@ import json
 import re
 
 from configgle import Fig
+from treekle import ReadError
 
 import pytest
 import torch
 
-from priml.lib.custom_json import ReadError
 from priml.model.attention.attention import Attention
 from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import SdpaNaive
@@ -1317,6 +1317,6 @@ class _MaskMessageRecorder(torch.nn.Module):
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

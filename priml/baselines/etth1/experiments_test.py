@@ -6,6 +6,7 @@ from typing import cast
 import copy
 
 from torch import Tensor
+from treekle import from_plain, json_loads
 
 import pytest
 import torch
@@ -14,7 +15,6 @@ from priml.baselines.etth1.checkpointer import Etth1Checkpointer
 from priml.baselines.etth1.data_test import fixture_config
 from priml.baselines.etth1.experiments import dlinear_type1, exp000, exp_smoke
 from priml.baselines.etth1.train_step import Etth1TrainLoop, Etth1TrainStep
-from priml.lib.custom_json import convert, parse
 from priml.testing.golden import assert_pprint_golden, mismatches
 
 
@@ -57,7 +57,6 @@ def test_schedule_matches_source_epoch_boundaries() -> None:
     assert dlinear_type1(2 / 10 - 1e-6) == 1
 
 
-@pytest.mark.compute_training
 def test_smoke_runs_end_to_end(tmp_path: Path) -> None:
     cfg = exp_smoke()
     cfg.base_dir = tmp_path
@@ -109,7 +108,6 @@ def test_early_stopping_ties_and_state_restore(tmp_path: Path) -> None:
         loop.close()
 
 
-@pytest.mark.compute_training
 def test_mid_epoch_resume_replays_exact_next_update(tmp_path: Path) -> None:
     cfg = exp_smoke()
     cfg.base_dir = tmp_path
@@ -134,15 +132,15 @@ def test_mid_epoch_resume_replays_exact_next_update(tmp_path: Path) -> None:
     resumed = cfg.make()
     try:
         resumed.load_state_dict(
-            convert(
+            from_plain(
                 cast(object, torch.load(checkpoint, weights_only=True)),
                 dict[str, object],
             ),
         )
         actual_batch = resumed._get_next_batch()
         assert not mismatches(
-            convert(batch, dict[str, Tensor]),
-            convert(actual_batch, dict[str, Tensor]),
+            from_plain(batch, dict[str, Tensor]),
+            from_plain(actual_batch, dict[str, Tensor]),
         )
         resumed._do_train_step(actual_batch)
         assert isinstance(resumed.step, Etth1TrainStep)
@@ -165,7 +163,6 @@ def epoch_config(directory: Path) -> Etth1TrainLoop.Config:
     return cfg
 
 
-@pytest.mark.compute_training
 @pytest.mark.parametrize("epochs", [1, 2])
 def test_step_budget_validates_complete_epochs(tmp_path: Path, epochs: int) -> None:
     cfg = epoch_config(tmp_path)
@@ -186,7 +183,6 @@ def test_step_budget_validates_complete_epochs(tmp_path: Path, epochs: int) -> N
     assert torch.equal(expected_rng, torch.get_rng_state())
 
 
-@pytest.mark.compute_training
 def test_resume_after_last_batch_before_validation(tmp_path: Path) -> None:
     cfg = epoch_config(tmp_path)
     control = cfg.make()
@@ -207,7 +203,6 @@ def test_resume_after_last_batch_before_validation(tmp_path: Path) -> None:
     assert torch.equal(expected_rng, torch.get_rng_state())
 
 
-@pytest.mark.compute_training
 def test_restore_into_running_loop_rewinds_iterator(tmp_path: Path) -> None:
     cfg = epoch_config(tmp_path)
     loop = cfg.make()
@@ -223,8 +218,8 @@ def test_restore_into_running_loop_rewinds_iterator(tmp_path: Path) -> None:
         loop.load_state_dict(state)
         actual = loop._get_next_batch()
         assert not mismatches(
-            convert(expected, dict[str, Tensor]),
-            convert(actual, dict[str, Tensor]),
+            from_plain(expected, dict[str, Tensor]),
+            from_plain(actual, dict[str, Tensor]),
         )
         loop._do_train_step(actual)
         assert not mismatches(expected_weights, loop.step.model.state_dict())
@@ -233,7 +228,6 @@ def test_restore_into_running_loop_rewinds_iterator(tmp_path: Path) -> None:
         loop.close()
 
 
-@pytest.mark.compute_training
 @pytest.mark.parametrize("resume", [False, True])
 def test_terminal_step_saves_validated_checkpoint(tmp_path: Path, resume: bool) -> None:
     cfg = epoch_config(tmp_path)
@@ -254,12 +248,12 @@ def test_terminal_step_saves_validated_checkpoint(tmp_path: Path, resume: bool) 
     assert len(loop.validation_losses) == 1
     assert loop.step.global_step == 5
     assert loop.current_epoch == 1
-    selector = parse(
+    selector = json_loads(
         (tmp_path / "checkpoints" / "best.json").read_text(),
         dict[str, object],
     )
     assert selector["step"] == 5
-    saved = convert(
+    saved = from_plain(
         cast(
             object,
             torch.load(
@@ -273,7 +267,6 @@ def test_terminal_step_saves_validated_checkpoint(tmp_path: Path, resume: bool) 
     assert saved["pending_epoch_completion"] is False
 
 
-@pytest.mark.compute_training
 def test_partial_epoch_does_not_force_epoch_validation(tmp_path: Path) -> None:
     cfg = epoch_config(tmp_path)
     cfg.max_steps = 4
@@ -285,6 +278,6 @@ def test_partial_epoch_does_not_force_epoch_validation(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

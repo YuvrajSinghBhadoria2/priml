@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, TypedDict, cast
 
 from torch import Tensor
+from treekle import ReadError
 
 import pytest
 import torch
 
-from priml.lib.custom_json import ReadError
 from priml.optimizers.adam_atan2 import AdamATan2
 
 
@@ -265,6 +265,6 @@ def _reference_step(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

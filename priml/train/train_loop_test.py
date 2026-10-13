@@ -35,10 +35,10 @@ if TYPE_CHECKING:
     from priml.train.custom_types import TrackerProtocol, TrainStepOutput
 
 from configgle import Fig, InlineConfig, Makeable, Makes, PartialConfig
+from treekle import from_plain
 
 from priml.cost import Cost, matmul_cost
 from priml.data.dummy import DummyDataset
-from priml.lib.custom_json import convert
 from priml.math.seed import RngState, get_rng_state, salt
 from priml.metrics.binary_accuracy import BinaryAccuracy
 from priml.metrics.topk import TopK
@@ -1045,18 +1045,26 @@ def test_a_resume_with_nothing_left_to_do_says_so(
         with caplog.at_level(logging.WARNING, logger=train_loop.__name__):
             loop.train()
         assert loop.step.global_step == 20  # Exited cleanly, trained nothing.
-        warnings = [
-            record for record in caplog.records if record.levelno >= logging.WARNING
+        # ``make`` resumed, so the checkpointer's warning comes first. Only these
+        # two loggers: on Apple silicon the seed module also warns about MPS RNG.
+        resumed, finished = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+            and record.name in {Checkpointer.__module__, train_loop.__name__}
         ]
-        assert [record.getMessage() for record in warnings] == [
-            (
-                "No training step ran: this experiment already completed at step "
-                f"20 (max_steps=20) in {loop.working_dir}. To train further, raise "
-                "the stop condition; to train again from scratch, fork it with a "
-                "new experiment_name or point working_dir elsewhere."
-            ),
-        ]
-        assert warnings[0].args == (20, 20, loop.working_dir)
+        assert resumed.name == Checkpointer.__module__
+        assert resumed.getMessage().startswith(
+            f"Resuming from checkpoint {checkpoint_dir}",
+        )
+        assert " at step 20 " in resumed.getMessage()
+        assert finished.getMessage() == (
+            "No training step ran: this experiment already completed at step "
+            f"20 (max_steps=20) in {loop.working_dir}. To train further, raise "
+            "the stop condition; to train again from scratch, fork it with a "
+            "new experiment_name or point working_dir elsewhere."
+        )
+        assert finished.args == (20, 20, loop.working_dir)
 
 
 @pytest.mark.parametrize(
@@ -1950,7 +1958,7 @@ def test_logged_train_loss_is_all_reduced_before_rank_zero_gate(
     calls: list[tuple[float, ...]] = []
 
     def all_reduce(tensor: Tensor) -> None:
-        calls.append(tuple(convert(tensor.tolist(), list[float])))
+        calls.append(tuple(from_plain(tensor.tolist(), list[float])))
         tensor.mul_(8)
 
     loop = _make_step_logging_loop_config().make()
@@ -5368,6 +5376,6 @@ def test_loader_length_is_zero_for_a_loader_over_a_stream() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

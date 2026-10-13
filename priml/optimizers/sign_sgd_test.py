@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 from torch import Tensor
+from treekle import ReadError
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from priml.lib.custom_json import ReadError
 from priml.optimizers.sign_sgd import (
     SignSGD,
     _is_distributed,
@@ -889,6 +889,6 @@ def test_sparse_embedding_step_defaults_to_distributed_aggregation(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

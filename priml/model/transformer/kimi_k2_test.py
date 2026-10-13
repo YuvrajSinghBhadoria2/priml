@@ -12,13 +12,13 @@ import sys
 import warnings
 
 from torch import Tensor
+from treekle import from_plain
+from treekle.absent import ABSENT
 
 import pytest
 import torch
 
 from priml import hub
-from priml.lib.absent import ABSENT
-from priml.lib.custom_json import convert
 from priml.model.attention.mla import MultiHeadLatentAttention
 from priml.model.attention.rope import HuggingFaceFrequencies, RoPE, YarnScaling
 from priml.model.embedding import Embedding
@@ -936,7 +936,7 @@ def _our_config_from_hf(
     q_lora_rank: int | None,
 ) -> KimiK2.Config:
     """Mirror an HF model's config into a ``KimiK2.Config``."""
-    hf_cfg = convert(hf_model.config.to_dict(), dict[str, object])
+    hf_cfg = from_plain(hf_model.config.to_dict(), dict[str, object])
     hf_cfg.setdefault("model_type", "deepseek_v3")
     hf_cfg["q_lora_rank"] = q_lora_rank
     hf_cfg["tie_word_embeddings"] = False
@@ -959,6 +959,6 @@ def _hf_state_dict_with_bias_fill(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

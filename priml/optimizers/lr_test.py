@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from torch import nn
+from treekle import ReadError
 
 import pytest
 import torch
 
-from priml.lib.custom_json import ReadError
 from priml.optimizers.lr import (
     apply_lr_scale,
     clip_grad_norm,
@@ -85,6 +85,6 @@ def test_optimizer_helpers_step_zero_and_clip_gradients() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

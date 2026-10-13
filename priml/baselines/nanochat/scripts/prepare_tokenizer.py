@@ -15,12 +15,12 @@ import tempfile
 
 from configgle import Fig
 from tokenizers import decoders, models, pre_tokenizers
+from treekle import json_loads
 
 import rustbpe
 import tokenizers
 
 from priml.baselines.nanochat.data import DEFAULT_ENCODE_THREADS
-from priml.lib.custom_json import JSONValue, parse
 from priml.paths import validated_output_path
 
 
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
     from numpy import array, save, zeros
     from pyarrow import Table, parquet
+    from treekle import PlainTree
 
     import tiktoken
 else:
@@ -55,10 +56,10 @@ def read_mapping(path: Path) -> dict[str, object]:
       mapping: The decoded object.
 
     """
-    return parse(path.read_text(), dict[str, object])
+    return json_loads(path.read_text(), dict[str, object])
 
 
-def write_mapping(path: Path, *, value: JSONValue) -> None:
+def write_mapping(path: Path, *, value: PlainTree) -> None:
     """Publish deterministic JSON after its complete contents have been written.
 
     Args:

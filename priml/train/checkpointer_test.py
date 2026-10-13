@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import Future
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 import functools
+import logging
 import math
+import os
 import shutil
 import tempfile
 import time
@@ -19,13 +22,13 @@ from torch.distributed.checkpoint import state_dict_loader, state_dict_saver
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from treekle import from_plain
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
-from priml.lib.custom_json import convert
 from priml.train import checkpointer
 from priml.train.checkpointer import (
     AsyncLocalStateDictStorer,
@@ -795,6 +798,51 @@ def test_resume_of_an_absent_explicit_step_names_what_exists(
         ckpt.load(_DictTarget({}), max_steps=1e9, guard=False)
 
 
+def test_a_resume_warns_with_the_directory_step_and_write_time(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    writer = Checkpointer(Checkpointer.Config(working_dir=tmp_path))
+    for step in (10, 20):
+        _save(writer, step, {"step": step})
+    written = 1_791_400_000
+    os.utime(tmp_path / "step_00000020.pt", (written, written))
+
+    with caplog.at_level(logging.INFO, logger=checkpointer.__name__):
+        assert Checkpointer(Checkpointer.Config(working_dir=tmp_path)).load(
+            _DictTarget({}),
+            max_steps=1e9,
+        )
+
+    [record] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    when = datetime.fromtimestamp(written).astimezone().isoformat(timespec="seconds")
+    assert (
+        f"Resuming from checkpoint {tmp_path / 'step_00000020.pt'} at step 20"
+        in record.message
+    )
+    assert f"written {when}" in record.message
+    assert "available steps [10, 20]" in record.message
+    assert f"whatever was saved under {tmp_path}" in record.message
+    assert "\n" not in record.message
+
+
+@pytest.mark.parametrize(("resume", "why"), [(True, "nothing"), (False, "resume")])
+def test_a_fresh_start_says_so_and_names_the_directory(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    resume: bool,
+    why: str,
+) -> None:
+    ckpt = Checkpointer(Checkpointer.Config(working_dir=tmp_path, resume=resume))
+
+    with caplog.at_level(logging.INFO, logger=checkpointer.__name__):
+        assert not ckpt.load(_DictTarget({}), max_steps=1e9)
+
+    [record] = [r for r in caplog.records if "Starting fresh" in r.message]
+    assert record.levelno == logging.INFO
+    assert record.message.startswith(f"Starting fresh at step 0 in {tmp_path}: {why}")
+
+
 def test_resume_without_a_best_record_keeps_the_sentinel(
     temp_checkpoint_dir: Path,
 ) -> None:
@@ -1468,7 +1516,7 @@ def test_plain_read_preserves_cpu_rng_state(
         ),
     }
 
-    rng_state = convert(loaded["rng"], dict[str, object])
+    rng_state = from_plain(loaded["rng"], dict[str, object])
     restored = rng_state["torch"]
     assert isinstance(restored, Tensor)
     assert restored.device.type == "cpu", (
@@ -1994,9 +2042,9 @@ def _resume_worker(result_dir: str, mesh: DeviceMesh) -> None:
         merged = target.loaded
         if merged is not None:
             reload_model.load_state_dict(
-                convert(merged["model"], dict[str, object]),
+                from_plain(merged["model"], dict[str, object]),
             )
-            reload_opt.load_state_dict(convert(merged["opt"], dict[str, object]))
+            reload_opt.load_state_dict(from_plain(merged["opt"], dict[str, object]))
         weight = _full_tensor(next(reload_model.parameters()))
         exp_avg = _full_tensor(_first_exp_avg(reload_opt))
         ok = (
@@ -2046,7 +2094,7 @@ def _world1_load_worker(ckpt_dir: str, result_dir: str, mesh: DeviceMesh) -> Non
         loaded = ckpt.load(target, max_steps=1e9, guard=False)
         merged = target.loaded
         if merged is not None:
-            model.load_state_dict(convert(merged["model"], dict[str, object]))
+            model.load_state_dict(from_plain(merged["model"], dict[str, object]))
         full = _full_tensor(next(model.parameters()))
         ref = cast(object, torch.load(Path(result_dir) / "full.pt"))
         assert isinstance(ref, Tensor)
@@ -2303,6 +2351,6 @@ def test_checkpoint_failure_reaches_real_peers(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -17,6 +17,7 @@ from typing import Literal, Protocol, Self, cast, override, runtime_checkable
 
 from configgle import Fig, Makeable, Makes
 from torch import Tensor, nn
+from treekle import from_plain
 
 import torch
 
@@ -29,7 +30,6 @@ from priml.cost import (
     resolve_dtype,
     traffic,
 )
-from priml.lib.custom_json import convert
 from priml.model.custom_types import (
     ChannelsIn,
     ChannelsOut,
@@ -909,9 +909,9 @@ class MoE(nn.Module):
         starts = torch.cat([offsets.new_zeros(1), offsets[:-1]])
 
         y = x_flat.new_zeros(x_flat.shape[0], self.channels_out)
-        active_values = convert(active.tolist(), list[int])
-        starts_values = convert(starts.tolist(), list[int])
-        counts_values = convert(counts.tolist(), list[int])
+        active_values = from_plain(active.tolist(), list[int])
+        starts_values = from_plain(starts.tolist(), list[int])
+        counts_values = from_plain(counts.tolist(), list[int])
         for expert_index, expert_id in enumerate(active_values):
             start = starts_values[expert_index]
             count = counts_values[expert_index]

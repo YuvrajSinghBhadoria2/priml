@@ -33,13 +33,13 @@ import time
 
 from configgle import Fig, Makeable, traverse
 from torch import Tensor
+from treekle import from_plain
 
 import torch
 import torch.distributed as dist
 
 from priml.data.custom_types import DatasetProtocol
 from priml.data.dummy import DummyDataset
-from priml.lib.custom_json import convert
 
 
 if TYPE_CHECKING:
@@ -1147,13 +1147,15 @@ class TrainLoop:
             # A collated batch carries its count as a 0-d tensor.
             count = batch.get("valid_count", 1)
             weight = (
-                int(count.item()) if isinstance(count, Tensor) else convert(count, int)
+                int(count.item())
+                if isinstance(count, Tensor)
+                else from_plain(count, int)
             )
             if weight == 0:
                 batch_start = time.perf_counter()
                 continue
             metric_only = bool(batch.pop("metric_only", False))
-            extra_votes = None
+            extra_votes: list[tuple[Tensor, dict[str, object]]] = []
             if metric_only:
                 model_output: object = torch.empty(0)
             else:
@@ -1163,7 +1165,7 @@ class TrainLoop:
                     fault_dump_interval_sec=self.phase_timer.fault_dump_interval_sec,
                 ):
                     step_results = self.step.eval_loss(**batch)
-                extra_votes = step_results.get("eval_extra_votes")
+                extra_votes = step_results.get("eval_extra_votes", [])
                 loss = step_results["loss"]
                 model_output = step_results["model"]
                 total_weight += weight
@@ -1188,13 +1190,12 @@ class TrainLoop:
                     fault_dump_interval_sec=self.phase_timer.fault_dump_interval_sec,
                 ):
                     metric.update(model_output, **batch, step_sec=batch_dt)
-                    if extra_votes:
-                        for extra_output, extra_batch in extra_votes:
-                            metric.update(
-                                extra_output,
-                                **extra_batch,
-                                step_sec=batch_dt,
-                            )
+                    for extra_output, extra_batch in extra_votes:
+                        metric.update(
+                            extra_output,
+                            **extra_batch,
+                            step_sec=batch_dt,
+                        )
                 self._record_cuda_timing(f"eval_metric_{name}_update", cuda_events)
 
             if narrate and num_batches % log_every == 0:
@@ -1235,7 +1236,7 @@ class TrainLoop:
         return results
 
     def run(self, *args: str) -> None:
-        """Run training (entry point for experimental.lib.launch).
+        """Run training (the entry point ``priml.launch`` calls).
 
         Args:
           *args: Args.

@@ -25,10 +25,9 @@ import math
 from configgle import Fig
 from torch import Tensor
 from torch.optim import Optimizer
+from treekle import from_plain
 
 import torch
-
-from priml.lib.custom_json import convert
 
 
 _ParamLike = Iterable[Tensor] | Iterable[dict[str, object]]
@@ -112,9 +111,9 @@ class AdamATan2(Optimizer):
         """Update every parameter in one group."""
         # A list is what a JSON-restored checkpoint holds, and torch's Adam
         # accepts one; a tuple-only check rejected a resumed run.
-        beta1, beta2 = convert(group["betas"], tuple[float, float])
-        lr = convert(group["lr"], float)
-        wd = convert(group["weight_decay"], float)
+        beta1, beta2 = from_plain(group["betas"], tuple[float, float])
+        lr = from_plain(group["lr"], float)
+        wd = from_plain(group["weight_decay"], float)
         for p in cast(list[Tensor], group["params"]):
             if p.grad is None:
                 continue

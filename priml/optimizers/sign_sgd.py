@@ -27,11 +27,10 @@ import math
 from configgle import Fig
 from torch import Tensor
 from torch.optim import Optimizer
+from treekle import from_plain
 
 import torch
 import torch.distributed as dist
-
-from priml.lib.custom_json import convert
 
 
 _ParamLike = Iterable[Tensor] | Iterable[dict[str, object]]
@@ -277,8 +276,8 @@ class SignSGD(Optimizer):
 
     def _step_group(self, group: dict[str, object]) -> None:
         """Update every parameter in one group."""
-        lr = convert(group["lr"], float)
-        wd = convert(group["weight_decay"], float)
+        lr = from_plain(group["lr"], float)
+        wd = from_plain(group["weight_decay"], float)
         params = cast(list[Tensor], group["params"])
         if group.get("sparse_embedding", False):
             sparse_parts = _sparse_embedding_parts(params)
@@ -360,8 +359,8 @@ class SignSGD(Optimizer):
         if sparse_parts is None:
             return
         _, _, weights = sparse_parts
-        lr = convert(group["lr"], float)
-        wd = convert(group["weight_decay"], float)
+        lr = from_plain(group["lr"], float)
+        wd = from_plain(group["weight_decay"], float)
         _sparse_embedding_step(
             local_weights_grad,
             local_ids,

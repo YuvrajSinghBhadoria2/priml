@@ -6,11 +6,11 @@ from collections.abc import Callable
 from typing import Final, cast
 
 from torch import Tensor
+from treekle import ReadError
 
 import pytest
 import torch
 
-from priml.lib.custom_json import ReadError
 from priml.optimizers import normuon
 from priml.optimizers.normuon import NorMuon
 
@@ -823,6 +823,6 @@ def test_a_prefix_of_the_coefficients_is_a_shorter_iteration() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

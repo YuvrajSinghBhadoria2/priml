@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, TypedDict, cast
 
 import math
 
+from treekle import json_loads
+
 import numpy as np
 
-from priml.lib.custom_json import parse
+from priml.data.arrays import load_array
 
 
 if TYPE_CHECKING:
@@ -32,7 +34,7 @@ def read_labels(manifest: Path) -> dict[str, int]:
       labels: Class labels keyed by normalized latent names.
 
     """
-    payload = parse(manifest.read_bytes(), _LabelManifest)
+    payload = json_loads(manifest.read_bytes(), _LabelManifest)
     return {name.replace("\\", "/"): label for name, label in payload["labels"]}
 
 
@@ -47,8 +49,13 @@ def read_image(path: Path) -> NDArray[np.uint8]:
 
     """
     if path.suffix.lower() == ".npy":
-        array = cast("NDArray[np.uint8]", np.load(path))
-        if array.dtype != np.uint8 or array.ndim < 3:
+        try:
+            array = load_array(path, np.uint8)
+        except TypeError as error:
+            raise ValueError(
+                f"Stored image {path} must be uint8 with at least three dimensions.",
+            ) from error
+        if array.ndim < 3:
             raise ValueError(
                 f"Stored image {path} must be uint8 with at least three dimensions.",
             )

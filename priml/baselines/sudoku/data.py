@@ -26,7 +26,7 @@ move with the input, which the train step never sees.
 
 from __future__ import annotations
 
-from dataclasses import field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, Self, TypedDict, cast, override
 
@@ -36,13 +36,14 @@ import math
 from configgle import Fig
 from numpy.typing import NDArray
 from torch import Tensor
+from treekle import from_plain, json_loads
 
 import numpy as np
 import torch
 
-from priml.baselines.arcagi1.augmentation import ColorDihedral
 from priml.baselines.sudoku.puzzle_spec import SudokuSpec
-from priml.lib.custom_json import convert, parse
+from priml.data.arrays import load_array
+from priml.data.color_dihedral import ColorDihedral
 from priml.math.basic import ceil_div
 from priml.math.seed import salt
 from priml.paths import resolve_working_dir
@@ -55,6 +56,42 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SplitArrays:
+    """One prepared split's arrays, as ``scripts/prepare_data.py`` writes them.
+
+    Integer-typed rather than width-typed: the preparer, the hard-catalog
+    builder, and test fixtures write the same layout at different widths.
+    """
+
+    inputs: NDArray[np.integer]
+    """``[rows, cells]`` puzzle tokens."""
+
+    labels: NDArray[np.integer]
+    """``[rows, cells]`` solution tokens."""
+
+    group_indices: NDArray[np.integer]
+    """``[puzzles + 1]`` row boundaries of each puzzle's copies."""
+
+
+def read_split_arrays(directory: Path, *, mmap: bool = False) -> SplitArrays:
+    """Read the arrays of one prepared split, checking each holds integers.
+
+    Args:
+      directory: The split directory, e.g. ``<dataset>/train``.
+      mmap: Memory-map ``inputs`` and ``labels`` instead of reading them.
+
+    Returns:
+      arrays: The split's inputs, labels, and group boundaries.
+
+    """
+    return SplitArrays(
+        inputs=load_array(directory / "all__inputs.npy", np.integer, mmap=mmap),
+        labels=load_array(directory / "all__labels.npy", np.integer, mmap=mmap),
+        group_indices=load_array(directory / "all__group_indices.npy", np.integer),
+    )
 
 
 class _SudokuSplit(TypedDict):
@@ -245,8 +282,8 @@ class _SudokuBatches:
         starts = self.bounds[:-1]
         # One host sync for every bound, not two per puzzle.
         bounds = zip(
-            convert(starts.tolist(), list[int]),
-            convert((self.bounds[1:] - starts).tolist(), list[int]),
+            from_plain(starts.tolist(), list[int]),
+            from_plain((self.bounds[1:] - starts).tolist(), list[int]),
             strict=True,
         )
         # Two-level shuffle: permute each puzzle's own augmented copies, then
@@ -297,14 +334,12 @@ def _load_split(dataset_dir: Path, split: str) -> _SudokuSplit:
             "`uv --quiet run --frozen python -m "
             "priml.baselines.sudoku.scripts.prepare_data`.",
         )
-    metadata = parse(metadata_path.read_text(), dict[str, object])
+    metadata = json_loads(metadata_path.read_text(), dict[str, object])
     logger.info("loading sudoku split %r from %s", split, path)
-    inputs_array = cast(NDArray[np.int64], np.load(path / "all__inputs.npy"))
-    labels_array = cast(NDArray[np.int64], np.load(path / "all__labels.npy"))
-    bounds_array = cast(NDArray[np.int64], np.load(path / "all__group_indices.npy"))
-    inputs = torch.from_numpy(inputs_array).to(torch.int32)
-    labels = torch.from_numpy(labels_array).to(torch.int32)
-    bounds = torch.from_numpy(bounds_array).long()
+    arrays = read_split_arrays(path)
+    inputs = torch.from_numpy(arrays.inputs).to(torch.int32)
+    labels = torch.from_numpy(arrays.labels).to(torch.int32)
+    bounds = torch.from_numpy(arrays.group_indices).long()
     logger.info(
         "sudoku %r: %d rows across %d puzzles",
         split,
@@ -315,7 +350,7 @@ def _load_split(dataset_dir: Path, split: str) -> _SudokuSplit:
         "inputs": inputs,
         "labels": labels,
         "group_indices": bounds,
-        "vocab_size": convert(metadata["vocab_size"], int),
+        "vocab_size": from_plain(metadata["vocab_size"], int),
     }
 
 

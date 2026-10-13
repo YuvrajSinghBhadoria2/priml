@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from string import Formatter
@@ -65,8 +66,8 @@ else:
     dcp = lazy_import("torch.distributed.checkpoint")  # ~1050 ms; async saves need it.
 
 from configgle import Fig, Makeable
+from treekle import from_plain, json_loads, to_plain
 
-from priml.lib.custom_json import convert, parse, to_builtins
 from priml.paths import resolve_working_dir, validated_output_path
 from priml.runtime import is_rank_zero
 
@@ -808,6 +809,14 @@ class Checkpointer:
         Returns True iff a checkpoint was restored (so the loop's start step is
         the resumed one, already set inside ``target``).
 
+        Resume is keyed by directory, not by launch: ``load`` continues whatever
+        was saved under ``working_dir``, which a ``TrainLoop`` derives from its
+        run's name (``/runs/{study_name}/{experiment_name}/checkpoints``). Two
+        launches under one name are one run; point a launch at a fresh
+        ``working_dir`` to start over. A resume logs a warning naming the
+        checkpoint, its step, write time and the steps available; a fresh start
+        logs the directory it starts in.
+
         Args:
           target: Checkpointable object (typically TrainLoop) to restore state.
           max_steps: Upper bound on training steps for rewind collision checks.
@@ -824,8 +833,15 @@ class Checkpointer:
             self._guard_overwrite(inventory, resumed_step, max_steps)
         if resumed_step is not None:
             self._restore_best_record([c for c in inventory if c.step <= resumed_step])
-        elif is_rank_zero():
-            (self.checkpoint_dir / "best.json").unlink(missing_ok=True)
+        else:
+            logger.info(
+                "Starting fresh at step 0 in %s: %s. A later launch that checkpoints "
+                "here resumes from it.",
+                self.checkpoint_dir,
+                "nothing to resume there" if self.resume else "resume is off",
+            )
+            if is_rank_zero():
+                (self.checkpoint_dir / "best.json").unlink(missing_ok=True)
         if is_rank_zero() and self.checkpoint_dir.exists():
             for entry in self.checkpoint_dir.iterdir():
                 if (
@@ -870,12 +886,19 @@ class Checkpointer:
             try:
                 chosen = inventory[self.resume_step]
             except IndexError:
-                logger.info(
-                    "No checkpoint to resume under %s; starting fresh from step 0.",
-                    self.checkpoint_dir,
-                )
                 return None
-        logger.info("Resuming from checkpoint %s.", chosen.path)
+        # A warning, not info: the directory, not the launch, decides what this run
+        # is, and a relaunch under a used name silently continues the old run.
+        logger.warning(
+            "Resuming from checkpoint %s at step %d (written %s; available steps %s): "
+            "this run continues whatever was saved under %s, which the run's name "
+            "chooses by default; a fresh directory starts over.",
+            chosen.path,
+            chosen.step,
+            _written_at(chosen.path),
+            [c.step for c in inventory],
+            self.checkpoint_dir,
+        )
         blob = self.storage.read(chosen.path, dict(target.state_dict()))
         target.load_state_dict(blob)
         return chosen.step
@@ -924,7 +947,7 @@ class Checkpointer:
             "value": self.best_value,
         }
         temp_path = path.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(to_builtins(payload)))
+        temp_path.write_text(json.dumps(to_plain(payload)))
         temp_path.replace(path)
 
     # A record naming a checkpoint no longer in the inventory protects nothing
@@ -936,17 +959,17 @@ class Checkpointer:
         path = self.checkpoint_dir / "best.json"
         if not path.is_file():
             return
-        record = parse(path.read_text(), dict[str, object])
+        record = json_loads(path.read_text(), dict[str, object])
         if (
-            convert(record.get("metric"), str, default="") != self.best_metric
-            or convert(record.get("mode"), str, default="") != self.best_mode
+            from_plain(record.get("metric"), str, default="") != self.best_metric
+            or from_plain(record.get("mode"), str, default="") != self.best_mode
         ):
             return
-        step = convert(record.get("step"), int)
+        step = from_plain(record.get("step"), int)
         if all(c.step != step for c in inventory):
             return
         self.best_step = step
-        self.best_value = convert(record.get("value"), float)
+        self.best_value = from_plain(record.get("value"), float)
         logger.info(
             "Restored best %s=%s at step %d from %s.",
             self.best_metric,
@@ -1048,6 +1071,16 @@ def _dir_size_mb(path: Path) -> float:
     else:
         total = path.stat().st_size
     return total / 1024**2
+
+
+def _written_at(path: Path) -> str:
+    """Local ISO time a checkpoint finished writing; a shard dir by its last marker."""
+    finished = path / ".metadata" if path.is_dir() else path
+    return (
+        datetime.fromtimestamp(finished.stat().st_mtime)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
 
 
 # A per-rank checkpoint-existence check can disagree (a shard becomes visible on one

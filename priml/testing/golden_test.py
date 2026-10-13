@@ -11,11 +11,11 @@ import textwrap
 import zlib
 
 from configgle.fig import Fig, Maker
+from treekle import ReadError
 
 import pytest
 import torch
 
-from priml.lib.custom_json import ReadError
 from priml.testing import golden, regenerate
 from priml.testing.golden import (
     assert_pprint_golden,
@@ -769,6 +769,6 @@ def test_read_tensors_wraps_invalid_pack_error_with_path(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

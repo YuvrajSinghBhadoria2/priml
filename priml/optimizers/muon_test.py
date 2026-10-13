@@ -10,12 +10,12 @@ import tempfile
 
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from treekle import ReadError
 
 import pytest
 import torch
 
 from priml import runtime
-from priml.lib.custom_json import ReadError
 from priml.optimizers import lr_scale
 from priml.optimizers.muon import (
     Muon,
@@ -597,6 +597,6 @@ def test_muon_sharded_matches_replicated_multirank(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

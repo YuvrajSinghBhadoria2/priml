@@ -32,6 +32,7 @@ import re
 import threading
 
 from pyarrow import parquet
+from treekle import ReadError, from_plain, json_loads
 
 import numpy as np
 import pyarrow as pa
@@ -46,7 +47,6 @@ from priml.baselines.nanochat.data import (
     Tokenizer,
     token_bytes_fingerprint,
 )
-from priml.lib.custom_json import ReadError, convert, parse
 from priml.metrics.bits_per_byte import BitsPerByte
 
 
@@ -176,11 +176,6 @@ def _data(corpus: Path, **overrides: object) -> NanoChatData:
     for name, value in overrides.items():
         setattr(config, name, value)
     return config.make()
-
-
-def _object_dict(value: object) -> dict[str, object]:
-    """Narrow a JSON object to a mutable string-keyed dictionary."""
-    return convert(value, dict[str, object])
 
 
 class _NumpyLoadSpy:
@@ -839,9 +834,7 @@ def _refingerprint(directory: Path, table: np.ndarray) -> None:
     """Rewrite the recipe so the fingerprint matches a replaced table."""
     np.save(directory / "token_bytes.npy", table)
     recipe_path = directory / "tokenizer_recipe.json"
-    recipe = _object_dict(
-        parse(recipe_path.read_text(), dict[str, object]),
-    )
+    recipe = json_loads(recipe_path.read_text(), dict[str, object])
     recipe["token_bytes_sha256"] = token_bytes_fingerprint(table)
     recipe_path.write_text(json.dumps(recipe))
 
@@ -1029,8 +1022,8 @@ def test_prepared_evaluation_replays_packed_rows_and_primary_byte_rule(
         seen: list[list[int]] = []
         for batch in data.eval_dataloader():
             seen.extend(
-                convert(row, list[int])
-                for row in convert(batch["label"].tolist(), list[object])
+                from_plain(row, list[int])
+                for row in from_plain(batch["label"].tolist(), list[object])
             )
             metric.update(torch.ones_like(batch["label"], dtype=torch.float32), **batch)
         assert seen == [[2, 0, 4, 1], [1, 2, 3, 0]]
@@ -1063,7 +1056,7 @@ def test_prepared_metadata_ignores_obsolete_checksums(
     prepared_config: NanoChatData.Config,
 ) -> None:
     path = Path(prepared_config.prepared_eval_manifest)
-    metadata = _object_dict(parse(path.read_text(), dict[str, object]))
+    metadata = json_loads(path.read_text(), dict[str, object])
     metadata["eval_x_sha256"] = "obsolete"
     metadata["eval_y_sha256"] = "obsolete"
     metadata["loaded_modules_and_assets"] = {
@@ -1090,13 +1083,9 @@ def test_prepared_manifest_batches_match_nonunit_eval_batch_geometry(
 ) -> None:
     train_path = Path(prepared_config.prepared_train_manifest)
     evaluation_path = Path(prepared_config.prepared_eval_manifest)
-    train_manifest = _object_dict(
-        parse(train_path.read_text(), dict[str, object]),
-    )
-    evaluation_manifest = _object_dict(
-        parse(evaluation_path.read_text(), dict[str, object]),
-    )
-    train = _object_dict(train_manifest["train"])
+    train_manifest = json_loads(train_path.read_text(), dict[str, object])
+    evaluation_manifest = json_loads(evaluation_path.read_text(), dict[str, object])
+    train = from_plain(train_manifest["train"], dict[str, object])
     train["seq_len"] = 2
     train_manifest["train"] = train
     evaluation_manifest["max_seq_len"] = 2
@@ -1121,11 +1110,11 @@ def test_prepared_manifest_batches_match_nonunit_eval_batch_geometry(
     literal = _load_array(eval_directory / "token_bytes_literal.npy").astype(
         np.int64,
     )
-    byte_tables = _object_dict(evaluation_manifest["byte_tables"])
-    primary_table = _object_dict(byte_tables["primary"])
+    byte_tables = from_plain(evaluation_manifest["byte_tables"], dict[str, object])
+    primary_table = from_plain(byte_tables["primary"], dict[str, object])
     primary_table["total_on_eval_y"] = int(primary[targets].sum(dtype=np.int64))
     byte_tables["primary"] = primary_table
-    literal_table = _object_dict(byte_tables["literal"])
+    literal_table = from_plain(byte_tables["literal"], dict[str, object])
     literal_table["total_on_eval_y"] = int(literal[targets].sum(dtype=np.int64))
     byte_tables["literal"] = literal_table
     byte_tables["scored_positions"] = int(np.count_nonzero(primary[targets]))
@@ -1143,7 +1132,7 @@ def test_prepared_batch_count_must_match_evaluation_rows(
     prepared_config: NanoChatData.Config,
 ) -> None:
     path = Path(prepared_config.prepared_eval_manifest)
-    manifest = _object_dict(parse(path.read_text(), dict[str, object]))
+    manifest = json_loads(path.read_text(), dict[str, object])
     manifest["batches"] = 1
     path.write_text(json.dumps(manifest))
     with pytest.raises(
@@ -1157,10 +1146,8 @@ def test_prepared_training_rows_must_contain_whole_batches(
     prepared_config: NanoChatData.Config,
 ) -> None:
     train_manifest_path = Path(prepared_config.prepared_train_manifest)
-    manifest = _object_dict(
-        parse(train_manifest_path.read_text(), dict[str, object]),
-    )
-    train = _object_dict(manifest["train"])
+    manifest = json_loads(train_manifest_path.read_text(), dict[str, object])
+    train = from_plain(manifest["train"], dict[str, object])
     train["batch_size"] = 2
     train["total_rows"] = 3
     manifest["train"] = train
@@ -2564,9 +2551,7 @@ def test_prepared_byte_table_invariants_are_checked_independently(
 ) -> None:
     directory = Path(prepared_config.prepared_eval_manifest).parent
     manifest_path = Path(prepared_config.prepared_eval_manifest)
-    manifest = _object_dict(
-        parse(manifest_path.read_text(), dict[str, object]),
-    )
+    manifest = json_loads(manifest_path.read_text(), dict[str, object])
     primary_path = directory / "token_bytes_primary.npy"
     literal_path = directory / "token_bytes_literal.npy"
     primary = _load_array(primary_path)
@@ -2582,11 +2567,11 @@ def test_prepared_byte_table_invariants_are_checked_independently(
     np.save(primary_path, primary)
     np.save(literal_path, literal)
     targets = _load_array(directory / "eval_y.npy")
-    byte_tables = _object_dict(manifest["byte_tables"])
-    primary_table = _object_dict(byte_tables["primary"])
+    byte_tables = from_plain(manifest["byte_tables"], dict[str, object])
+    primary_table = from_plain(byte_tables["primary"], dict[str, object])
     primary_table["total_on_eval_y"] = int(primary[targets].sum(dtype=np.int64))
     byte_tables["primary"] = primary_table
-    literal_table = _object_dict(byte_tables["literal"])
+    literal_table = from_plain(byte_tables["literal"], dict[str, object])
     literal_table["total_on_eval_y"] = int(literal[targets].sum(dtype=np.int64))
     byte_tables["literal"] = literal_table
     byte_tables["scored_positions"] = int(np.count_nonzero(primary[targets]))
@@ -2638,12 +2623,12 @@ def test_prepared_scoring_totals_are_recomputed_from_evaluation_targets(
         Path(prepared_config.prepared_eval_manifest).parent
         / "packed-eval-manifest.json"
     )
-    manifest = _object_dict(parse(path.read_text(), dict[str, object]))
-    byte_tables = _object_dict(manifest["byte_tables"])
+    manifest = json_loads(path.read_text(), dict[str, object])
+    byte_tables = from_plain(manifest["byte_tables"], dict[str, object])
     if field == "scored_positions":
         byte_tables[field] = value
     else:
-        table = _object_dict(byte_tables[field])
+        table = from_plain(byte_tables[field], dict[str, object])
         table["total_on_eval_y"] = value
         byte_tables[field] = table
     manifest["byte_tables"] = byte_tables
@@ -2677,7 +2662,7 @@ def test_prepared_evaluation_manifest_must_match_its_packing(
         Path(prepared_config.prepared_eval_manifest).parent
         / "packed-eval-manifest.json"
     )
-    manifest = _object_dict(parse(path.read_text(), dict[str, object]))
+    manifest = json_loads(path.read_text(), dict[str, object])
     manifest[field] = value
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="geometry"):
@@ -2711,6 +2696,6 @@ def test_cpu_serial_stream_skips_redundant_device_copy(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

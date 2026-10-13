@@ -9,6 +9,7 @@ import math
 
 from configgle import PartialConfig
 from torch import Tensor, nn
+from treekle import from_plain
 
 import pytest
 import torch
@@ -30,7 +31,6 @@ from priml.baselines.nanochat.train_step import (
     matrix_parameters,
     nanochat_optimizer,
 )
-from priml.lib.custom_json import convert
 from priml.math.schedules import trapezoidal
 from priml.model.attention.value_gated_attention import (
     ValueGatedAttention,
@@ -375,6 +375,8 @@ class _EndpointTrajectory(nn.Module):
         return torch.cat(losses)
 
 
+# Marked: it pins exp022's eight distinct layers through three updates at the
+# narrowest width they build at; its 0.4 s on x86 is the op-by-op bitwise replay.
 @pytest.mark.compute_training
 def test_exp022_three_updates_match_portable_golden() -> None:
     """Pin the CPU reference model and optimizer interaction across three updates."""
@@ -470,7 +472,6 @@ def _batch() -> dict[str, Tensor]:
     return {"media": rows[:, :-1], "label": rows[:, 1:]}
 
 
-@pytest.mark.compute_training
 def test_loss_decreases_over_a_few_steps() -> None:
     """The recipe actually learns on a repeated batch.
 
@@ -506,7 +507,6 @@ def test_the_optimizer_partitions_the_model() -> None:
             assert not any("embed" in name or "lm_head" in name for name in names)
 
 
-@pytest.mark.compute_training
 def test_an_optimizer_step_waits_for_the_whole_token_batch() -> None:
     """Gradient accumulation is what holds the token batch fixed.
 
@@ -577,7 +577,6 @@ def test_an_invalid_geometry_is_rejected_by_name(field: str, value: float) -> No
         config.make()
 
 
-@pytest.mark.compute_training
 def test_the_budget_clock_excludes_warmup_steps() -> None:
     """Compilation must not consume the budget it is supposed to precede."""
     step = _step(budget_warmup_steps=2)
@@ -601,7 +600,6 @@ def test_the_default_warmup_matches_the_reference() -> None:
     assert NanoChatTrainStep.Config().budget_warmup_steps == 11
 
 
-@pytest.mark.compute_training
 def test_the_warmup_is_counted_in_steps_not_passes() -> None:
     """Otherwise accumulation silently shortens it by its own factor.
 
@@ -622,7 +620,6 @@ def test_the_warmup_is_counted_in_steps_not_passes() -> None:
     assert step.elapsed_sec > 0.0
 
 
-@pytest.mark.compute_training
 def test_loop_side_work_is_charged_to_the_budget_past_warmup() -> None:
     """Loading is training time: the reference's clock brackets it too.
 
@@ -642,7 +639,6 @@ def test_loop_side_work_is_charged_to_the_budget_past_warmup() -> None:
     assert step.elapsed_sec >= charged + 5.0
 
 
-@pytest.mark.compute_training
 def test_resuming_does_not_rerun_the_budget_warmup() -> None:
     """A resumed run must not get free, uncharged training.
 
@@ -664,7 +660,6 @@ def test_resuming_does_not_rerun_the_budget_warmup() -> None:
     assert resumed.elapsed_sec > charged
 
 
-@pytest.mark.compute_training
 def test_progress_drives_the_learning_rate() -> None:
     """Every schedule reads budget progress, not step index.
 
@@ -673,9 +668,12 @@ def test_progress_drives_the_learning_rate() -> None:
     against a horizon that does not exist.
     """
     step = _step(train_budget_sec=100.0)
-    initial = convert(cast(object, step.optimizer.param_groups[0]["initial_lr"]), float)
+    initial = from_plain(
+        cast(object, step.optimizer.param_groups[0]["initial_lr"]),
+        float,
+    )
     step.train_step(**_batch())
-    assert convert(
+    assert from_plain(
         cast(object, step.optimizer.param_groups[0]["lr"]),
         float,
     ) == pytest.approx(initial)
@@ -683,10 +681,11 @@ def test_progress_drives_the_learning_rate() -> None:
     # Most of the budget spent: the trapezoid is into its decay.
     step.elapsed_sec = 75.0
     step.train_step(**_batch())
-    assert convert(cast(object, step.optimizer.param_groups[0]["lr"]), float) < initial
+    assert (
+        from_plain(cast(object, step.optimizer.param_groups[0]["lr"]), float) < initial
+    )
 
 
-@pytest.mark.compute_training
 def test_every_optimizer_members_rate_is_reported() -> None:
     """One ``lr`` would name whichever member the composite happens to list first.
 
@@ -705,7 +704,6 @@ def test_every_optimizer_members_rate_is_reported() -> None:
     assert rates["lr_4_normuon"] != rates["lr_0_fusedadamw"]
 
 
-@pytest.mark.compute_training
 def test_weight_decay_anneals_with_the_budget() -> None:
     """Decay outliving the learning rate shrinks the final weights for nothing.
 
@@ -726,7 +724,6 @@ def test_weight_decay_anneals_with_the_budget() -> None:
         assert group["weight_decay"] < group["initial_weight_decay"]
 
 
-@pytest.mark.compute_training
 def test_divergence_raises_rather_than_burning_the_budget() -> None:
     """A diverged language-model run does not recover.
 
@@ -738,7 +735,6 @@ def test_divergence_raises_rather_than_burning_the_budget() -> None:
         step.train_step(**_batch())
 
 
-@pytest.mark.compute_training
 def test_a_diverged_pass_is_caught_at_the_batch_it_belongs_to() -> None:
     """The guard reads once per UPDATE, so a mid-batch pass must still abort.
 
@@ -761,7 +757,6 @@ def test_a_diverged_pass_is_caught_at_the_batch_it_belongs_to() -> None:
     assert step.global_step == 1
 
 
-@pytest.mark.compute_training
 def test_divergence_clears_the_pending_accumulation() -> None:
     """A caught divergence must not leave half a token batch behind.
 
@@ -787,7 +782,6 @@ def test_eval_returns_per_token_loss_for_the_metric() -> None:
     assert out["model"].shape == (2, 8)
 
 
-@pytest.mark.compute_training
 def test_state_round_trips_including_the_clock() -> None:
     """A resumed run must not re-anneal from the top.
 
@@ -849,7 +843,6 @@ def test_a_checkpoint_without_the_warmup_gate_is_refused() -> None:
         step.load_state_dict(state)
 
 
-@pytest.mark.compute_training
 def test_a_partial_accumulation_is_dropped_at_a_boundary() -> None:
     """Gradients must not mix across a pass over the data."""
     step = _step(tokens_per_optimizer_step=4 * SEQ)
@@ -938,6 +931,8 @@ class _SmokeSteps(nn.Module):
         return torch.cat(losses)
 
 
+# Marked: an end-to-end freeze of three recipe updates at four channels; its 0.4 s
+# on x86 is the op-by-op bitwise replay, not the model's size.
 @pytest.mark.compute_training
 def test_three_steps_bfb() -> None:
     """Freeze three optimizer steps of the recipe, end to end.
@@ -1162,7 +1157,7 @@ def test_an_integer_rate_is_rescaled_with_width() -> None:
     assert isinstance(finalized, CompositeOptimizer.Config)
     (scaled,) = finalized.optimizers
     assert isinstance(scaled, PartialConfig)
-    assert convert(cast(object, scaled.lr), float) == 1 / (192 / 768) ** 0.5
+    assert from_plain(cast(object, scaled.lr), float) == 1 / (192 / 768) ** 0.5
 
 
 def test_a_scaled_member_without_a_numeric_rate_is_refused() -> None:
@@ -1180,6 +1175,6 @@ def test_learning_rates_reports_a_plain_optimizer() -> None:
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

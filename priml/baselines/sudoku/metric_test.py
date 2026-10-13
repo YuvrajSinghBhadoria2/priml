@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from torch import Tensor
+from treekle import ReadError
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from priml.baselines.sudoku.metric import GridAccuracy
-from priml.lib.custom_json import ReadError
 
 
 def _packed(predictions: Tensor, prefix: int = 1) -> Tensor:
@@ -245,6 +245,6 @@ def test_compute_moves_counts_to_the_current_cuda_device(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -168,7 +168,6 @@ def _model(
 
 @pytest.mark.parametrize("mixer", [False, True])
 @pytest.mark.parametrize("recurrent", [False, True])
-@pytest.mark.compute_large_fixture
 def test_every_corner_of_the_lattice_runs(mixer: bool, recurrent: bool) -> None:
     """Architecture and recurrence vary independently, as config values."""
     model = _model(
@@ -194,7 +193,6 @@ def test_recurrence_adds_no_parameters() -> None:
     assert plain == recurrent
 
 
-@pytest.mark.compute_training
 def test_backward_graph_is_flat_in_recurrence_depth() -> None:
     """Gradient cost must not grow with cycle count.
 
@@ -1340,6 +1338,6 @@ def test_core_compile_and_rotary_optional_paths(
 
 
 if __name__ == "__main__":
-    from priml.lib.testing.main import test_main
+    from priml.lib.testing.runner import test_main
 
     test_main(__file__)
