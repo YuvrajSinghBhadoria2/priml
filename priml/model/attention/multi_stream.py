@@ -15,7 +15,7 @@ import torch
 from priml.cost import (
     Cost,
     cost,
-    resolve_dtype,
+    nbytes,
 )
 from priml.model.attention.attention import (
     AttentionProjections,
@@ -173,12 +173,13 @@ class MultiStreamAttention(nn.Module):
             seq_len: int,
             batch_size: int,
             dtype: torch.dtype | None,
+            context_len: int = 0,
             **kwargs: object,
         ) -> Cost:
             """Cost every stream's ``seq_len`` tokens, each stream attending jointly.
 
             Each stream pays its own projections, runs the kernel at its own
-            dropout over the ``num_streams * seq_len`` concatenated keys, and
+            dropout over every stream's concatenated cached and new keys, and
             shares those keys only across its own ``seq_len`` query rows. A
             shared norm runs on every stream's rows but is owned once.
 
@@ -186,6 +187,7 @@ class MultiStreamAttention(nn.Module):
               seq_len: Tokens per sequence of one stream.
               batch_size: Sequences per step.
               dtype: Activation dtype; ``None`` is torch's default.
+              context_len: Tokens each stream's KV cache already holds.
               **kwargs: The open bus, forwarded to every child.
 
             Returns:
@@ -271,7 +273,7 @@ class MultiStreamAttention(nn.Module):
                 (
                     cost(
                         self.attn_kernel,
-                        seq_len=seq_len * self.num_streams,
+                        seq_len=(context_len + seq_len) * self.num_streams,
                         batch_size=batch_size,
                         dtype=dtype,
                         num_heads=self.num_heads,
@@ -286,11 +288,10 @@ class MultiStreamAttention(nn.Module):
             )
             return replace(
                 total + kernels,
-                bytes_state=resolve_dtype(dtype).itemsize
-                * self.num_streams
-                * 2
-                * self.num_heads_kv
-                * self.channels_head,
+                bytes_state=nbytes(
+                    self.num_streams * 2 * self.num_heads_kv * self.channels_head,
+                    dtype,
+                ),
             )
 
     def __init__(self, config: Config) -> None:

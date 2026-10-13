@@ -53,6 +53,7 @@ from priml.cost import (
     cost,
     elementwise_cost,
     matmul_cost,
+    nbytes,
     reduction_cost,
     resolve_dtype,
     traffic,
@@ -392,7 +393,7 @@ class GTrXLPolicy(nn.Module):
             row = self.num_layers * self.channels_hidden + 1
             return replace(
                 total,
-                bytes_state=self.dtype.itemsize * batch_size * row,
+                bytes_state=nbytes(batch_size * row, self.dtype),
             )
 
     def __init__(self, config: Config) -> None:
@@ -780,7 +781,7 @@ def _activation_rhs_matmul_cost(
         dtype=dtype,
     )
     dt = resolve_dtype(dtype)
-    extra = (batch_size - 1) * channels_in * channels_out * dt.itemsize
+    extra = nbytes((batch_size - 1) * channels_in * channels_out, dt)
     cells = dict(full.cells)
     cells["bytes", "primal", "matmul", dt] += extra
     cells["bytes", "adjoint", "matmul", dt] += 2 * extra

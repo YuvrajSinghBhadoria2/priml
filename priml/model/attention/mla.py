@@ -69,7 +69,7 @@ import torch
 from priml.cost import (
     Cost,
     cost,
-    resolve_dtype,
+    nbytes,
     traffic,
 )
 from priml.model.attention.kernel import (
@@ -420,6 +420,7 @@ class MultiHeadLatentAttention(nn.Module):
             seq_len: int,
             batch_size: int,
             dtype: torch.dtype | None,
+            context_len: int = 0,
             **kwargs: object,
         ) -> Cost:
             """Cost the projections, norms, rotary, kernel, and the latent cache.
@@ -432,6 +433,8 @@ class MultiHeadLatentAttention(nn.Module):
               seq_len: Tokens per sequence.
               batch_size: Sequences per step.
               dtype: Activation dtype; ``None`` is torch's default.
+              context_len: Tokens each sequence already holds in its cache; only
+                0 is priced.
               **kwargs: The open bus, forwarded to every child.
 
             Returns:
@@ -439,8 +442,14 @@ class MultiHeadLatentAttention(nn.Module):
 
             Raises:
               TypeError: The kernel slot's config carries no ``cost``.
+              NotImplementedError: ``context_len`` is nonzero.
 
             """
+            # A cached step re-expands every cached latent through ``proj_kv_b``,
+            # or absorbs it into the queries, so its cost is not the uncached
+            # one over more keys. Refuse rather than price it as uncached.
+            if context_len:
+                raise NotImplementedError("MLA does not price a cached step.")
             q_path = (
                 (self.proj_q,)
                 if self.q_lora_rank is None
@@ -497,8 +506,10 @@ class MultiHeadLatentAttention(nn.Module):
             )
             return replace(
                 total,
-                bytes_state=resolve_dtype(dtype).itemsize
-                * (self.kv_lora_rank + self.channels_qk_rope_head),
+                bytes_state=nbytes(
+                    self.kv_lora_rank + self.channels_qk_rope_head,
+                    dtype,
+                ),
             )
 
         # Every width here is DERIVED -- a head count times a per-head width, or a LoRA

@@ -607,6 +607,13 @@ def test_latent_attention_cost_attends_over_expanded_heads_when_not() -> None:
     )
 
 
+def test_mla_cost_refuses_a_cached_step() -> None:
+    config, _ = _mla_config()
+    finalized = config.copy_tree().finalize()
+    with pytest.raises(NotImplementedError, match="cached step"):
+        finalized.cost(seq_len=2, batch_size=3, dtype=None, context_len=5)
+
+
 def test_mla_cost_is_projections_plus_kernel_and_caches_the_latent() -> None:
     config, _ = _mla_config()
     finalized = config.copy_tree().finalize()

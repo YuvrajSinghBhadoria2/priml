@@ -1324,6 +1324,33 @@ def test_multi_stream_cost_matches_torch_per_stream_token() -> None:
     )
 
 
+@pytest.mark.parametrize("seq_len", [1, 8])
+def test_multi_stream_cached_step_cost_matches_torch(seq_len: int) -> None:
+    """Each stream's queries attend to every stream's cached and new keys.
+
+    ``seq_len=1`` is one decode step, which emits one token per stream; 8 is
+    a chunk.
+    """
+    assert_cost_matches_torch(
+        MultiStreamAttention.Config(
+            channels_in=7,
+            num_heads=4,
+            num_heads_kv=2,
+            channels_head=5,
+            num_streams=3,
+            attn_kernel=SdpaNaive.Config(),
+        ),
+        build_input=lambda: tuple(
+            torch.randn(6, seq_len, 7, requires_grad=True) for _ in range(3)
+        ),
+        run=partial(_step_after_cache, context_len=9),
+        seq_len=seq_len,
+        batch_size=6,
+        dtype=None,
+        context_len=9,
+    )
+
+
 def test_multi_stream_cost_counts_shared_norms_once() -> None:
     config = MultiStreamAttention.Config(
         channels_in=16,
@@ -1494,6 +1521,24 @@ def test_multistream_independent_qk_norm_scales_are_each_read_once() -> None:
         - shared["bytes", "primal", "elementwise"].sum()
         == torch.bfloat16.itemsize * 4
     )
+
+
+def _step_after_cache(
+    module: nn.Module,
+    xs: tuple[Tensor, ...],
+    *,
+    context_len: int,
+) -> Tensor:
+    """Attend ``xs`` after ``context_len`` tokens of fresh, zeroed stream caches."""
+    assert isinstance(module, MultiStreamAttention)
+    lead = xs[0]
+    states = module.alloc_kv_cache(
+        batch=lead.shape[0],
+        max_seq=context_len + lead.shape[-2],
+    )
+    for state in states:
+        state.length = state.seen = context_len
+    return torch.stack(module(list(xs), cache=_layer_cache(module, states))).sum()
 
 
 if __name__ == "__main__":

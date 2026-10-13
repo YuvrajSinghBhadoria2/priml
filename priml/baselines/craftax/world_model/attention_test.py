@@ -79,6 +79,12 @@ def test_varlen_attention_cost_refuses_a_memory() -> None:
         config.cost(seq_len=3, batch_size=2, dtype=torch.float32, memory_len=0)
 
 
+def test_varlen_attention_cost_refuses_a_cache() -> None:
+    config = VarlenAttention.Config(channels_in=8, num_heads=2).finalize()
+    with pytest.raises(ValueError, match="attends from no cache"):
+        config.cost(seq_len=3, batch_size=2, dtype=torch.float32, context_len=5)
+
+
 @pytest.mark.parametrize(("causal", "dropout"), [(False, 0.0), (True, 0.25)])
 def test_varlen_attention_refuses_bidirectional_or_dropout(
     causal: bool,
