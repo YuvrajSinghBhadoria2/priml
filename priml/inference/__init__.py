@@ -10,4 +10,5 @@ eval prompts, so a quantization method that occasionally stalls is penalized.
 
 from priml.inference.benchmark import InferenceResult, exp000
 
+
 __all__ = ["InferenceResult", "exp000"]

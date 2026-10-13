@@ -15,10 +15,12 @@ a quantization method that occasionally stalls is penalized.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
+import time
+
 import torch
+
 from priml.cost import cost
 from priml.model.attention.attention import Attention
 from priml.model.attention.rope import RoPE
@@ -85,7 +87,6 @@ def build_model_config(
     num_layers: int = 2,
     num_heads: int = 4,
     num_heads_kv: int = 2,
-    max_seq_len: int = 512,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Transformer.Config:
     """Build a small decoder-only Transformer config.
@@ -96,7 +97,6 @@ def build_model_config(
       num_layers: Number of transformer blocks.
       num_heads: Query heads.
       num_heads_kv: Key/value heads (GQA).
-      max_seq_len: Maximum sequence length.
       dtype: Parameter dtype.
 
     Returns:
