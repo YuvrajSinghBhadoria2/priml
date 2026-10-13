@@ -85,10 +85,18 @@ def test_benchmark_is_deterministic() -> None:
     cfg = build_model_config(hidden_size=64, num_layers=1, num_heads=2, num_heads_kv=1)
     prompts = torch.randint(0, 256, (2, 16), dtype=torch.long)
     r1 = benchmark(
-        cfg, prompt_token_ids=prompts, max_new_tokens=4, seed=42, device="cpu"
+        cfg,
+        prompt_token_ids=prompts,
+        max_new_tokens=4,
+        seed=42,
+        device="cpu",
     )
     r2 = benchmark(
-        cfg, prompt_token_ids=prompts, max_new_tokens=4, seed=42, device="cpu"
+        cfg,
+        prompt_token_ids=prompts,
+        max_new_tokens=4,
+        seed=42,
+        device="cpu",
     )
     assert r1.total_tokens == r2.total_tokens
 
@@ -111,10 +119,16 @@ def test_frozen_prompts_are_fixed() -> None:
 def test_kv_bytes_reduced_by_gqa() -> None:
     """GQA (fewer KV heads) reduces KV bytes."""
     cfg_mha = build_model_config(
-        hidden_size=128, num_layers=2, num_heads=4, num_heads_kv=4
+        hidden_size=128,
+        num_layers=2,
+        num_heads=4,
+        num_heads_kv=4,
     )
     cfg_gqa = build_model_config(
-        hidden_size=128, num_layers=2, num_heads=4, num_heads_kv=2
+        hidden_size=128,
+        num_layers=2,
+        num_heads=4,
+        num_heads_kv=2,
     )
     kv_mha = compute_kv_bytes(cfg_mha, context_len=64, dtype=torch.bfloat16)
     kv_gqa = compute_kv_bytes(cfg_gqa, context_len=64, dtype=torch.bfloat16)
