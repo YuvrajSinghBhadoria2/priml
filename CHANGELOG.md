@@ -7,6 +7,35 @@ All notable priml changes are documented here. This project follows
 
 ### Added
 
+- `priml.model.ae`: pretrained autoencoders behind one contract
+  (`custom_types.py`): `Encoder.encode(x) -> Distribution`,
+  `Decoder.decode(z) -> Tensor`, `Autoencoder` both, over arbitrary leading
+  dims. A `Distribution` has `sample(*, generator)` and `mode()`; INVAE
+  returns a `DiagonalGaussian`, RAE and VTP a `PointMass`. Implementations:
+  `INVAE`, `VTP` (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE`
+  (`rae_dinov2_base`). Each config has `encoder` and `decoder` slots, either
+  `None`; each half carries its own `checkpoint` and reads only its own
+  tensors. `Config.from_hf` parses a published `config.json`, `load()` builds
+  from a Hub repository or local directory, and `remap_*_state_dict` renames
+  published tensors. Checkpoints are config nodes (`HubFile` at a commit
+  revision, `UrlFile`, `LocalFile`), and every published default pins its
+  SHA-256; each config's `latent_norm` holds its published normalizer
+  (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`).
+- `priml/model/ae/testdata/rae_reference.pt` and `vtp_reference.pt`: each
+  reference's own outputs at its pinned commit, replayed bit for bit by
+  `rae_test` and `vtp_test`.
+- `priml.math.quantization`: `lloyd_max` (exact Lloyd-Max fitting on sorted
+  samples, the cube-root high-resolution start, standard-normal levels),
+  `fits` (uniform, quantile, and moment-matched levels), and `nearest`
+  (batched nearest-level `quantize` / `dequantize`).
+- SpeedrunDiT: storage codecs (`FloatCodec`, `ScalarTableCodec` with injected
+  table fits and channel grouping), a corpus receipt checked at load time,
+  `prepare_data.py --experiment`, `benchmark_codec.py`, and experiments
+  exp002 (VTP), exp003 (RAE, float16 storage), and exp004 (RAE, uint8
+  storage). The loader refuses a corpus whose preparation has not finished.
+  `images/source.json` binds the crops every corpus shares to their ImageNet
+  source, and a rerun resumes only with the same source, producers, seed, and
+  (for a seeded corpus) batch size.
 - `cost(..., context_len=...)` prices a step after `context_len` cached
   tokens: `Attention`, `GatedAttention`, and `MultiStreamAttention` attend
   their `seq_len` queries to `context_len + seq_len` keys. One decode step is
@@ -29,6 +58,26 @@ All notable priml changes are documented here. This project follows
 
 ### Changed
 
+- `priml.model.invae` moved to `priml.model.ae.invae`. `AutoencoderKL`,
+  `VAE_F16D32`, `VAE_F8D4`, `vae_models`, `encode_image`, `decode_latents`,
+  and `load_invae` are removed; build `INVAE.Config().make()` and call
+  `encode` / `decode`. INVAE now loads the published diffusers file
+  `REPA-E/e2e-invae-hf`, whose tensors equal REG's `e2e-invae-400k.pt`.
+- SpeedrunDiT: `SpeedrunTrainStep.Config.latent_scale` is replaced by the
+  `latent_norm` slot, filled at loop finalize from the dataset's autoencoder
+  (INVAE's is the same `* 0.3099`). `PairedImageLatentDataset.Config` gains
+  `latent_subdir`, `autoencoder`, `codec`, and `seed`, and requires a
+  `corpus.json` receipt; record one for an existing REG corpus, and bind its
+  crops, with `prepare_data.py --receipt-only --source <imagenet>`.
+  `prepare_data.py` takes `--experiment` in place of `--output`,
+  `--checkpoint`, and `--resolution`. `PairedImageLatentDataset.Config.sample`
+  chooses a posterior draw or its mode, and is part of the receipt's
+  identity; the receipt format is 3, so re-record an existing corpus with
+  `--receipt-only`.
+- SpeedrunDiT: `SpeedrunTrainStep.Config.ema` keeps parameter shadows
+  (`shadow_kind="param_dict"`); the module-copy default could not deepcopy the
+  composable `replicate` model, so every distributed run failed at its first
+  EMA update. EMA state saved under the old default does not load into it.
 - `Cost` and `Report` carry their `axes`, so a slice answers by the axes it
   kept whether or not it holds a cell. An empty slice used to accept any axis
   and read a sub-table where a full one read zero.
@@ -47,6 +96,18 @@ All notable priml changes are documented here. This project follows
 
 ### Fixed
 
+- SpeedrunDiT: gradient accumulation weights micro-batches by their sample
+  counts, the step reports `skipped_steps`, refuses a closure-based optimizer
+  its stochastic objective cannot serve, and names a teacher that returns no
+  feature tuple.
+- SpeedrunDiT: the model refuses `encoder_blocks < 1`, whose value-residual
+  blends never trained, and freezes the fusion mask token when no token or path
+  is ever dropped; replicated ranks let such untrained parameters drift apart.
+  It refuses a `drop_ratio` outside `[0, 1)` and a `path_drop_prob` outside
+  `[0, 1]`. A model built on the meta device initializes every tensor, and its
+  cost counts the projector when no depth projects.
+- SpeedrunDiT: the corpus loader refuses two files naming one pair, and an
+  image that is not `[3, H, W]` uint8.
 - Costs at `torch.float4_e2m1fn_x2` count two values per byte. Every byte
   count multiplied by `itemsize`, which is one byte per two packed fp4 values,
   so fp4 traffic and cache state were doubled.

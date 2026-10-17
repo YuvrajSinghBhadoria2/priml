@@ -100,7 +100,18 @@ def projection_loss(
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LossTerms:
-    """Unreduced objective and its component losses."""
+    """Unreduced objective and its component losses.
+
+    Attributes:
+      loss: Per-sample weighted sum of the four terms.
+      mean_loss: Batch mean of ``loss``, the scalar the step backpropagates.
+      velocity: Per-sample latent velocity error.
+      cls: Per-sample CLS velocity error.
+      projection: Per-sample REG alignment loss.
+      cfm: Contrastive flow loss over the batch.
+      output: The model output the terms were scored on.
+
+    """
 
     loss: Tensor
     mean_loss: Tensor
@@ -229,12 +240,8 @@ class SpeedrunObjective:
         )
         cfm = contrastive_flow_loss(
             output.velocity,
-            target,
-            weight=(
-                time.reshape(-1, *([1] * (target.ndim - 1)))
-                if self.cfm_weighting == "linear"
-                else None
-            ),
+            target=target,
+            weight=time[broadcast] if self.cfm_weighting == "linear" else None,
         )
         mean_loss = (
             velocity.mean()

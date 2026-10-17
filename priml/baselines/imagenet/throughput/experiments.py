@@ -80,6 +80,7 @@ def exp000() -> LoaderThroughput.Config:
       https://github.com/libffcv/ffcv-imagenet
       Leclerc et al. 2022. FFCV: Accelerating training by removing data
       bottlenecks.
+      License: ``LICENSES/ffcv-imagenet``.
 
     Results:
       TBD.

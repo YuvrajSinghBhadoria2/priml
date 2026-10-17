@@ -1,85 +1,61 @@
-"""Local ImageNet/INVAE preparation without the REG repository at runtime."""
+"""The corpus preparer builds exactly what the experiment declares."""
 
 from __future__ import annotations
 
+from dataclasses import field
+from functools import partial
 from pathlib import Path
-from typing import Final, Protocol, cast
+from typing import Final, cast, override
 from unittest.mock import Mock
 
-import argparse
-import hashlib
-import re
+import shutil
 
+from configgle import Fig, Makeable
 from PIL import Image
-from treekle import json_loads
+from torch import Tensor, nn
+from torch.nn import functional
+from treekle import from_plain, json_loads
 
-import numpy as np
 import pytest
 import torch
 
+from priml.baselines.speedrundit.corpus import (
+    RECEIPT,
+    CorpusMismatchError,
+    save_stored,
+    table_path,
+)
 from priml.baselines.speedrundit.data import PairedImageLatentDataset
+from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
 from priml.baselines.speedrundit.scripts import prepare_data
-from priml.data.arrays import load_array
-from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
+from priml.model.ae.distribution import PointMass
+from priml.model.ae.invae_test import tiny
+from priml.model.ae.latent_norm import LatentNormalizer, ScaleLatents
 
 
 _CWD: Final = Path(__file__).resolve().parent
+_SIZE: Final = 16
+"""Crop side the fake autoencoder asks for; square because center_crop cuts squares."""
+
+_GRID: Final = (2, 3)
+"""The fake latent's height and width."""
 
 
-class _Flags(Protocol):
-    source: Path
-    output: Path
-    resolution: int
-    checkpoint: Path | None
-    device: str
-    limit: int | None
-
-
-class _FakeVAE:
-    def encode(self, image: torch.Tensor) -> object:
-        class Posterior:
-            def sample(self) -> torch.Tensor:
-                # encode_image returns the fixed INVAE latent geometry.
-                return torch.ones(image.shape[0], 32, 16, 16)
-
-        return Posterior()
-
-
-def _fake_load_invae(*_args: object, **_kwargs: object) -> _FakeVAE:
-    return _FakeVAE()
-
-
-@pytest.fixture
-def pinned_invae(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Stand in for the pinned download: a supplied copy passes, else this path."""
-    pinned = tmp_path / "pinned-invae.pt"
-
-    def checkpoint(supplied: Path | None) -> Path:
-        return supplied if supplied is not None else pinned
-
-    monkeypatch.setattr(prepare_data, "invae_checkpoint", checkpoint)
-    return pinned
-
-
-def _synsets() -> list[str]:
-    """Return the 1,000 ImageNet synsets in the shipped label order."""
-    labels = _CWD.parents[2] / "data/processors/labels_imagenet.txt"
-    return labels.read_text(encoding="utf-8").splitlines()
-
-
-def _gradient(size: tuple[int, int]) -> Image.Image:
-    """Return an RGB image whose every pixel differs, so a misplaced crop shows."""
-    image = Image.new("RGB", size)
-    for x in range(image.width):
-        for y in range(image.height):
-            image.putpixel((x, y), (x * 18, y * 18, (x + y) * 9))
-    return image
+def test_prepared_corpus_loads_back_as_the_encoder_wrote_it(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=3)
+    config = _source(tmp_path)
+    assert prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2) == 3
+    dataset = config.make()
+    assert len(dataset) == 3
+    sample = dataset[1]
+    expected = _MeanAutoencoder.Config().make().encode(sample["image"][None]).mode()[0]
+    assert torch.equal(sample["latent"], expected)
 
 
 def test_center_crop_box_downsamples_before_center_crop() -> None:
     image = _gradient((12, 8))
 
-    cropped = prepare_data.center_crop(image, 4)
+    cropped = prepare_data.center_crop(image, size=4)
     expected = image.resize((6, 4), Image.Resampling.BOX).crop((1, 0, 5, 4))
 
     assert cropped.size == (4, 4)
@@ -92,7 +68,7 @@ def test_center_crop_resizes_short_axis_and_centers_both_axes() -> None:
         for y in range(image.height):
             image.putpixel((x, y), (x * 30, y * 40, 0))
 
-    cropped = prepare_data.center_crop(image, 4)
+    cropped = prepare_data.center_crop(image, size=4)
     expected = image.resize((6, 4), Image.Resampling.BICUBIC).crop((1, 0, 5, 4))
 
     assert cropped.size == (4, 4)
@@ -115,192 +91,416 @@ def test_center_crop_floors_odd_center_offsets(
     resized = image.resize(resized_size, Image.Resampling.BOX)
     expected = resized.crop(crop_box)
 
-    assert prepare_data.center_crop(image, 4).tobytes() == expected.tobytes()
+    assert prepare_data.center_crop(image, size=4).tobytes() == expected.tobytes()
 
 
-@pytest.mark.usefixtures("pinned_invae")
-def test_prepare_forwards_checkpoint_device_and_limit(
+def test_images_are_center_cropped_to_the_autoencoder_size(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(
+        config,
+        imagenet=_imagenet(tmp_path, count=1),
+        device="cpu",
+    )
+    with Image.open(Path(config.working_dir) / "images/00000/img00000000.png") as image:
+        assert image.size == (_SIZE, _SIZE)
+
+
+def test_a_rerun_keeps_what_is_already_encoded(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    encoding = from_plain(_receipt(config)["details"], dict[str, object])["encoding"]
+    assert from_plain(encoding, dict[str, object])["newly_encoded"] == 0
+
+
+def test_a_second_corpus_reuses_the_shared_images(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    _ = prepare_data.prepare(_source(tmp_path), imagenet=raw, device="cpu")
+    image = tmp_path / "corpus/images/00000/img00000001.png"
+    before = image.stat().st_mtime_ns
+    other = _source(tmp_path, latent_subdir="other")
+    _ = prepare_data.prepare(other, imagenet=raw, device="cpu")
+    assert image.stat().st_mtime_ns == before
+    assert len(other.make()) == 2
+
+
+def test_receipt_records_the_producers_and_error(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(
+        config,
+        imagenet=_imagenet(tmp_path, count=2),
+        device="cpu",
+    )
+    receipt = _receipt(config)
+    identity = from_plain(receipt["identity"], dict[str, object])
+    autoencoder = from_plain(identity["autoencoder"], dict[str, object])
+    assert autoencoder["latent_shape"] == [4, *_GRID]
+    error = from_plain(
+        from_plain(receipt["details"], dict[str, object])["error"],
+        dict[str, object],
+    )
+    assert error["mse"] == 0.0
+
+
+def test_fitted_codec_writes_its_table_before_the_latents(tmp_path: Path) -> None:
+    config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
+    _ = prepare_data.prepare(
+        config,
+        imagenet=_imagenet(tmp_path, count=3),
+        device="cpu",
+    )
+    assert table_path(Path(config.working_dir) / "vae-in").is_file()
+    latent = config.make()[0]["latent"]
+    assert latent.dtype == torch.float32
+
+
+def test_a_table_left_without_a_receipt_is_refitted_for_its_new_producer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    first_class = _synsets()[0]
-    image_dir = tmp_path / "raw" / "train" / first_class
-    image_dir.mkdir(parents=True)
-    for image_id in (1, 2):
-        Image.new("RGB", (320, 280), (image_id, 64, 32)).save(
-            image_dir / f"{first_class}_{image_id}.JPEG",
-        )
-    checkpoint = tmp_path / "checkpoint.pt"
-    captured: dict[str, object] = {}
+    config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
+    config.autoencoder = tiny()
+    raw = _imagenet(tmp_path, count=3)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(prepare_data, "write_receipt", _interrupted)
+        with pytest.raises(OSError, match="interrupted"):
+            prepare_data.prepare(config, imagenet=raw, device="cpu")
+    directory = Path(config.working_dir) / config.latent_subdir
+    orphan = table_path(directory).read_bytes()
+    config.sample = False
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    assert table_path(directory).read_bytes() != orphan
+    assert len(config.make()) == 3
 
-    def load(checkpoint: Path | None, *, device: str) -> _FakeVAE:
-        captured["checkpoint"] = checkpoint
-        captured["device"] = device
-        del checkpoint
-        return _FakeVAE()
 
-    monkeypatch.setattr(prepare_data, "load_invae", load)
-    output = tmp_path / "prepared"
+def _interrupted(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise OSError("interrupted")
 
-    assert (
+
+def test_an_interrupted_preparation_never_loads_as_a_finished_corpus(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _imagenet(tmp_path, count=6)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu", limit=2)
+    saves: list[Path] = []
+    with monkeypatch.context() as scoped:
+        scoped.setattr(prepare_data, "save_stored", partial(_save_twice, saves=saves))
+        with pytest.raises(OSError, match="interrupted"):
+            prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2)
+    with pytest.raises(CorpusMismatchError, match="unfinished"):
+        _ = config.make()
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2)
+    assert len(config.make()) == 6
+
+
+def _save_twice(path: Path, stored: Tensor, *, saves: list[Path]) -> None:
+    if len(saves) == 2:
+        raise OSError("interrupted")
+    saves.append(path)
+    save_stored(path, stored=stored)
+
+
+def test_latents_without_a_receipt_are_refused(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    latent = Path(config.working_dir) / config.latent_subdir / "00000/x.npy"
+    latent.parent.mkdir(parents=True)
+    save_stored(latent, stored=torch.zeros(1))
+    with pytest.raises(CorpusMismatchError, match="no receipt"):
         prepare_data.prepare(
-            tmp_path / "raw",
-            output,
-            checkpoint=checkpoint,
+            config,
+            imagenet=_imagenet(tmp_path, count=1),
             device="cpu",
-            limit=1,
         )
-        == 1
-    )
-    assert captured == {"checkpoint": checkpoint, "device": "cpu"}
-    assert (output / "images/00000/img00000000.png").exists()
-    assert not (output / "images/00000/img00000001.png").exists()
 
 
-@pytest.mark.parametrize("resolution", [255, 257, 511, 513])
-def test_prepare_rejects_unsupported_resolution(
+@pytest.mark.parametrize("limits", [{"batch_size": 0}, {"limit": 0}])
+def test_preparation_needs_positive_batch_size_and_limit(
     tmp_path: Path,
-    resolution: int,
+    limits: dict[str, int],
 ) -> None:
-    with pytest.raises(ValueError, match=r"^resolution must be 256 or 512$"):
-        prepare_data.prepare(tmp_path, tmp_path / "out", resolution=resolution)
-
-
-def test_add_arguments_parses_paths_choices_and_defaults(tmp_path: Path) -> None:
-    parser = argparse.ArgumentParser()
-    prepare_data._add_arguments(parser)
-
-    source = tmp_path / "source"
-    output = tmp_path / "out"
-    flags = cast(
-        _Flags,
-        parser.parse_args(["--source", str(source), "--output", str(output)]),
-    )
-    assert isinstance(flags.source, Path)
-    assert isinstance(flags.output, Path)
-    assert flags.source == source
-    assert flags.output == output
-    assert isinstance(flags.source, Path)
-    assert isinstance(flags.output, Path)
-    assert isinstance(flags.resolution, int)
-    assert flags.resolution == 256
-    assert flags.checkpoint is None
-    assert isinstance(flags.device, str)
-    assert flags.device == "cuda"
-    assert flags.limit is None
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--source", str(source)])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["--output", str(output)])
-    with pytest.raises(SystemExit):
-        parser.parse_args(
-            ["--source", str(source), "--output", str(output), "--resolution", "257"],
+    with pytest.raises(ValueError, match="must be positive"):
+        prepare_data.prepare(
+            _source(tmp_path),
+            imagenet=tmp_path,
+            device="cpu",
+            **limits,
         )
 
 
-def test_main_forwards_arguments_and_reports_prepared_count(
+def test_a_limited_run_fits_the_table_on_the_whole_source(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=4)
+    codec = ScalarTableCodec.Config(num_fit_images=4)
+    limited = _source(tmp_path / "limited", codec=codec)
+    full = _source(tmp_path / "full", codec=codec.copy_tree())
+    _ = prepare_data.prepare(limited, imagenet=raw, device="cpu", limit=1)
+    _ = prepare_data.prepare(full, imagenet=raw, device="cpu")
+    tables = [
+        table_path(Path(c.working_dir) / c.latent_subdir).read_bytes()
+        for c in (limited, full)
+    ]
+    assert tables[0] == tables[1]
+
+
+def test_a_rerun_keeps_the_fit_record(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=3)
+    config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=2))
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    fit = from_plain(_receipt(config)["details"], dict[str, object])["fit"]
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    assert from_plain(_receipt(config)["details"], dict[str, object])["fit"] == fit
+    assert from_plain(fit, dict[str, object])["num_images"] == 2
+
+
+def test_latents_of_the_wrong_shape_are_refused_before_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    source = tmp_path / "source"
+    monkeypatch.setattr(_MeanAutoencoder, "encode", _three_channel_encode)
+    config = _source(tmp_path)
+    with pytest.raises(ValueError, match="declares"):
+        prepare_data.prepare(
+            config,
+            imagenet=_imagenet(tmp_path, count=1),
+            device="cpu",
+        )
+    assert not any((Path(config.working_dir) / config.latent_subdir).rglob("*.npy"))
+
+
+def _three_channel_encode(model: nn.Module, images: Tensor) -> PointMass:
+    del model
+    return PointMass(torch.zeros(images.shape[0], 3, *_GRID))
+
+
+def test_fit_sample_is_distinct_sorted_and_in_range() -> None:
+    chosen = prepare_data.fit_sample_indices(1_000, num_images=37)
+    assert len(chosen) == 37
+    assert chosen == sorted(set(chosen))
+    assert chosen[0] >= 0
+    assert chosen[-1] < 1_000
+    assert prepare_data.fit_sample_indices(1_000, num_images=37) == chosen
+
+
+def test_fit_sample_takes_every_image_of_a_small_corpus() -> None:
+    assert prepare_data.fit_sample_indices(5, num_images=37) == [0, 1, 2, 3, 4]
+
+
+def test_fit_sample_reaches_across_the_synset_sorted_order() -> None:
+    """Images arrive grouped by class; a prefix would fit on the first classes only."""
+    chosen = prepare_data.fit_sample_indices(1_000, num_images=10)
+    assert chosen[-1] >= 500
+
+
+def test_receipt_only_admits_an_existing_reg_corpus(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    (Path(config.working_dir) / "vae-in" / RECEIPT).unlink()
+    assert prepare_data.record_receipt(config) == 2
+    assert len(config.make()) == 2
+
+
+def test_rerun_refuses_to_relabel_another_producers_bytes(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    prepare_data.prepare(config, imagenet=raw, device="cpu")
+    receipt = Path(config.working_dir) / config.latent_subdir / RECEIPT
+    before = receipt.read_bytes()
+    config.codec = FloatCodec.Config(dtype=torch.float16)
+    with pytest.raises(CorpusMismatchError):
+        prepare_data.prepare(config, imagenet=raw, device="cpu")
+    assert receipt.read_bytes() == before
+
+
+def test_receipt_only_never_replaces_a_receipt(tmp_path: Path) -> None:
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(
+        config,
+        imagenet=_imagenet(tmp_path, count=2),
+        device="cpu",
+    )
+    receipt = Path(config.working_dir) / config.latent_subdir / RECEIPT
+    before = receipt.read_bytes()
+    config.codec = FloatCodec.Config(dtype=torch.float16)
+    with pytest.raises(CorpusMismatchError):
+        prepare_data.record_receipt(config)
+    assert receipt.read_bytes() == before
+
+
+def test_rerun_refuses_changed_encoding_seed(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    config.autoencoder = tiny()
+    config.seed = 1
+    prepare_data.prepare(config, imagenet=raw, device="cpu", limit=1)
+    config.seed = 2
+    with pytest.raises(CorpusMismatchError, match=r"other settings:\n  seed"):
+        prepare_data.prepare(config, imagenet=raw, device="cpu")
+
+
+def test_resume_ignores_device_and_an_unseeded_batch_size(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=3)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2, limit=1)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu:0", batch_size=3)
+    assert len(config.make()) == 3
+
+
+def test_shared_images_refuse_a_different_source(tmp_path: Path) -> None:
+    first, second = (
+        _imagenet(tmp_path / "first", count=2),
+        _imagenet(tmp_path / "second", count=3),
+    )
+    prepare_data.prepare(_source(tmp_path), imagenet=first, device="cpu")
+    other = _source(tmp_path, latent_subdir="other")
+    with pytest.raises(CorpusMismatchError, match="records_sha256"):
+        prepare_data.prepare(other, imagenet=second, device="cpu")
+
+
+def test_shared_images_accept_the_same_source_at_another_path(tmp_path: Path) -> None:
+    first = _imagenet(tmp_path / "first", count=2)
+    second = Path(shutil.copytree(first, tmp_path / "second"))
+    prepare_data.prepare(_source(tmp_path), imagenet=first, device="cpu")
+    other = _source(tmp_path, latent_subdir="other")
+    assert prepare_data.prepare(other, imagenet=second, device="cpu") == 2
+
+
+def test_crops_that_record_no_source_are_refused_until_adopted(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu")
+    (Path(config.working_dir) / "images" / prepare_data.IMAGE_SOURCE).unlink()
+    other = _source(tmp_path, latent_subdir="other")
+    with pytest.raises(CorpusMismatchError, match="record no source"):
+        prepare_data.prepare(other, imagenet=raw, device="cpu")
+    assert prepare_data.record_receipt(config, imagenet=raw) == 2
+    assert prepare_data.prepare(other, imagenet=raw, device="cpu") == 2
+
+
+def test_lower_limit_preserves_labels_for_existing_latents(tmp_path: Path) -> None:
+    raw = _imagenet(tmp_path, count=3)
+    config = _source(tmp_path)
+    prepare_data.prepare(config, imagenet=raw, device="cpu")
+    prepare_data.prepare(config, imagenet=raw, device="cpu", limit=2)
+    assert len(config.make()) == 3
+
+
+def test_non_finite_encoder_output_is_refused_before_coding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_MeanAutoencoder, "encode", _non_finite_encode)
+    config = _source(tmp_path, codec=ScalarTableCodec.Config(num_fit_images=1))
+    with pytest.raises(ValueError, match="non-finite"):
+        prepare_data.prepare(
+            config,
+            imagenet=_imagenet(tmp_path, count=1),
+            device="cpu",
+        )
+    assert not table_path(Path(config.working_dir) / config.latent_subdir).exists()
+
+
+def _non_finite_encode(model: nn.Module, images: Tensor) -> PointMass:
+    del model
+    return PointMass(torch.full((images.shape[0], 4, *_GRID), float("nan")))
+
+
+def test_seeded_posterior_is_stable_after_resume(tmp_path: Path) -> None:
+    """A limit inside a window still encodes the whole window, as a full run does.
+
+    At 4px the latent has 8 values, below the size where torch's CPU normal
+    sampler draws a batch's first rows identically to a smaller batch.
+    """
+    raw = _imagenet(tmp_path, count=3)
+    full, resumed = _source(tmp_path / "full"), _source(tmp_path / "resumed")
+    full.autoencoder = tiny()
+    full.autoencoder.image_size = 4
+    resumed.autoencoder = full.autoencoder.copy_tree()
+    full.seed = resumed.seed = 7
+    prepare_data.prepare(full, imagenet=raw, device="cpu", batch_size=2)
+    prepare_data.prepare(resumed, imagenet=raw, device="cpu", batch_size=2, limit=1)
+    prepare_data.prepare(resumed, imagenet=raw, device="cpu", batch_size=2)
+    for index in range(3):
+        assert torch.equal(
+            full.make()[index]["latent"],
+            resumed.make()[index]["latent"],
+        )
+
+
+def test_an_unseeded_resume_encodes_with_the_same_random_weights(
+    tmp_path: Path,
+) -> None:
+    """The mode is deterministic, so only the weights can differ."""
+    raw = _imagenet(tmp_path, count=2)
+    full, resumed = _source(tmp_path / "full"), _source(tmp_path / "resumed")
+    full.autoencoder = tiny()
+    full.sample = resumed.sample = False
+    resumed.autoencoder = full.autoencoder.copy_tree()
+    prepare_data.prepare(full, imagenet=raw, device="cpu", batch_size=1)
+    prepare_data.prepare(resumed, imagenet=raw, device="cpu", batch_size=1, limit=1)
+    _ = torch.rand(1)
+    prepare_data.prepare(resumed, imagenet=raw, device="cpu", batch_size=1)
+    assert torch.equal(full.make()[1]["latent"], resumed.make()[1]["latent"])
+
+
+def test_resume_keeps_latents_already_saved_in_a_reencoded_window(
+    tmp_path: Path,
+) -> None:
+    """Every save renames a new file into place, so a rewrite changes the inode."""
+    raw = _imagenet(tmp_path, count=2)
+    config = _source(tmp_path)
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2, limit=1)
+    latent = Path(config.working_dir) / config.latent_subdir / "00000"
+    before = (latent / "img-latents-00000000.npy").stat().st_ino
+    _ = prepare_data.prepare(config, imagenet=raw, device="cpu", batch_size=2)
+    assert (latent / "img-latents-00000000.npy").stat().st_ino == before
+    assert (latent / "img-latents-00000001.npy").is_file()
+
+
+def test_dataset_config_is_the_experiments_resolved_corpus() -> None:
+    config = prepare_data.dataset_config("exp000")
+    assert Path(config.working_dir) == Path("/opt/scratch/datasets/speedrundit")
+    assert config.latent_subdir == "vae-in"
+
+
+def test_main_requires_a_source_unless_recording_a_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.argv", ["prepare_data", "--experiment", "exp000"])
+    with pytest.raises(SystemExit):
+        _ = prepare_data.main()
+
+
+def test_main_hands_the_experiment_corpus_to_the_preparer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: list[tuple[PairedImageLatentDataset.Config, Path]] = []
+
+    def fake(
+        config: PairedImageLatentDataset.Config,
+        imagenet: Path,
+        **_: object,
+    ) -> int:
+        called.append((config, imagenet))
+        return 0
+
+    raw = tmp_path / "raw"
     for synset in _synsets():
-        (source / "train" / synset).mkdir(parents=True)
-    output = tmp_path / "out"
-    checkpoint = tmp_path / "invae.pt"
+        (raw / "train" / synset).mkdir(parents=True)
+    monkeypatch.setattr(prepare_data, "prepare", fake)
     monkeypatch.setattr(
         "sys.argv",
-        [
-            "prepare_data",
-            "--source",
-            str(source),
-            "--output",
-            str(output),
-            "--resolution",
-            "512",
-            "--checkpoint",
-            str(checkpoint),
-            "--device",
-            "cpu",
-            "--limit",
-            "3",
-        ],
+        ["prepare_data", "--source", str(raw), "--directory", str(tmp_path / "c")],
     )
-    captured: dict[str, object] = {}
-
-    def prepare(
-        actual_source: Path,
-        *,
-        output: Path,
-        resolution: int,
-        checkpoint: Path | None,
-        device: str,
-        limit: int | None,
-    ) -> int:
-        captured.update(
-            source=actual_source,
-            output=output,
-            resolution=resolution,
-            checkpoint=checkpoint,
-            device=device,
-            limit=limit,
-        )
-        return 7
-
-    monkeypatch.setattr(prepare_data, "prepare", prepare)
-
     assert prepare_data.main() == 0
-    assert captured == {
-        "source": source,
-        "output": output,
-        "resolution": 512,
-        "checkpoint": checkpoint,
-        "device": "cpu",
-        "limit": 3,
-    }
-    assert capsys.readouterr().out == "7\n"
-
-
-@pytest.mark.parametrize(
-    ("record", "message"),
-    [
-        (
-            {"label": "bad", "file_path": "unused"},
-            "expected an integer ImageNet label: {'label': 'bad', 'file_path': 'unused'}",
-        ),
-        (
-            {"label": 3, "file_path": 7},
-            "expected an ImageNet file path: {'label': 3, 'file_path': 7}",
-        ),
-    ],
-)
-@pytest.mark.usefixtures("pinned_invae")
-def test_prepare_rejects_untyped_records(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    record: dict[str, object],
-    message: str,
-) -> None:
-    def source_make(config: ExtractedImageNetSource.Config) -> object:
-        del config
-        return [record]
-
-    # The real synset mapping passes both records through unchanged: one label
-    # names no synset, the other is already an index.
-    monkeypatch.setattr(ExtractedImageNetSource.Config, "make", source_make)
-    monkeypatch.setattr(prepare_data, "load_invae", _fake_load_invae)
-
-    with pytest.raises(TypeError) as error:
-        prepare_data.prepare(tmp_path, tmp_path / "out", device="cpu")
-    assert str(error.value) == message
-
-
-def test_prepare_refuses_to_write_over_its_source(tmp_path: Path) -> None:
-    source = tmp_path / "raw"
-    source.mkdir()
-    with pytest.raises(ValueError, match="aliases protected input"):
-        prepare_data.prepare(source, source, limit=1)
-    assert list(source.iterdir()) == []
+    config, source = called[0]
+    assert source == raw
+    assert Path(config.working_dir) == tmp_path / "c"
+    assert cast(object, config.autoencoder) is not None
 
 
 def test_main_refuses_a_partial_imagenet_before_preparing(
@@ -315,33 +515,31 @@ def test_main_refuses_a_partial_imagenet_before_preparing(
     monkeypatch.setattr(prepare_data, "prepare", prepare)
     monkeypatch.setattr(
         "sys.argv",
-        ["prepare_data", "--source", str(tmp_path / "raw"), "--output", "out"],
+        ["prepare_data", "--source", str(tmp_path / "raw"), "--directory", "out"],
     )
 
     with pytest.raises(ValueError, match="1 are missing and 1 are unexpected"):
-        prepare_data.main()
+        _ = prepare_data.main()
     prepare.assert_not_called()
 
 
-def test_prepare_creates_manifest_for_empty_source(
+def test_main_refuses_a_corpus_directory_over_its_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    pinned_invae: Path,
 ) -> None:
-    source = tmp_path / "raw"
-    (source / "train").mkdir(parents=True)
-    captured: dict[str, object] = {}
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    prepare = Mock()
+    monkeypatch.setattr(prepare_data, "prepare", prepare)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["prepare_data", "--source", str(raw), "--directory", str(raw)],
+    )
 
-    def load(checkpoint: Path | None, *, device: str) -> _FakeVAE:
-        captured.update(checkpoint=checkpoint, device=device)
-        return _FakeVAE()
-
-    monkeypatch.setattr(prepare_data, "load_invae", load)
-    output = tmp_path / "prepared"
-
-    assert prepare_data.prepare(source, output) == 0
-    assert captured == {"checkpoint": pinned_invae, "device": "cuda"}
-    assert (output / "vae-in/dataset.json").read_bytes() == b'{"labels": []}'
+    with pytest.raises(ValueError, match="aliases protected input"):
+        _ = prepare_data.main()
+    prepare.assert_not_called()
+    assert list(raw.iterdir()) == []
 
 
 def test_main_help_keeps_every_description_line(
@@ -352,116 +550,83 @@ def test_main_help_keeps_every_description_line(
     monkeypatch.setattr("sys.argv", ["prepare_data", "--help"])
 
     with pytest.raises(SystemExit):
-        prepare_data.main()
+        _ = prepare_data.main()
 
     assert "first line\nsecond line\n" in capsys.readouterr().out
 
 
-def test_main_help_includes_module_description(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setattr("sys.argv", ["prepare_data", "--help"])
+class _MeanAutoencoder(nn.Module):
+    """Encodes an image as its pooled channel means, the first repeated as a fourth."""
 
-    with pytest.raises(SystemExit) as error:
-        prepare_data.main()
+    class Config(Fig["_MeanAutoencoder"]):
+        image_size: int = _SIZE
+        """Crop side."""
 
-    assert error.value.code == 0
-    assert capsys.readouterr().out == (
-        "usage: prepare_data [-h] --source SOURCE --output OUTPUT\n"
-        "                    [--resolution {256,512}] [--checkpoint CHECKPOINT]\n"
-        "                    [--device DEVICE] [--limit LIMIT]\n\n"
-        "Crop extracted ImageNet and encode paired 32-channel INVAE latents.\n\n"
-        "--source is the extracted ILSVRC2012 training set: train/<synset>/*.JPEG,\n"
-        "one directory for each of the 1,000 synsets; nothing else is read. The\n"
-        "INVAE checkpoint is downloaded at a pinned revision and checked against\n"
-        "its SHA-256; --checkpoint names a local copy, checked the same way.\n\n"
-        "options:\n"
-        "  -h, --help            show this help message and exit\n"
-        "  --source SOURCE\n"
-        "  --output OUTPUT\n"
-        "  --resolution {256,512}\n"
-        "  --checkpoint CHECKPOINT\n"
-        "  --device DEVICE\n"
-        "  --limit LIMIT\n"
-    )
+        latent_norm: Makeable[LatentNormalizer] = field(
+            default_factory=ScaleLatents.Config,
+        )
+        """The identity scale."""
 
+        def latent_shape(self) -> tuple[int, int, int]:
+            """Return four channels on the fake's grid."""
+            return 4, *_GRID
 
-@pytest.mark.usefixtures("pinned_invae")
-def test_preparer_writes_paired_source_layout(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_class = _synsets()[0]
-    image_dir = tmp_path / "raw" / "train" / first_class
-    image_dir.mkdir(parents=True)
-    Image.new("L", (320, 280), 128).save(image_dir / f"{first_class}_1.JPEG")
-    monkeypatch.setattr(prepare_data, "load_invae", _fake_load_invae)
-    devices: list[torch.device] = []
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        del config
 
-    def encode(vae: object, image: torch.Tensor) -> torch.Tensor:
-        del vae
-        devices.append(image.device)
-        # `prepare` encodes one image; INVAE latents are [1, 32, 16, 16] at 256px.
-        return torch.ones(1, 32, 16, 16)
+    def encode(self, image: Tensor, /) -> PointMass:
+        """Return ``[B, 4, 2, 3]`` pooled channel means."""
+        means = functional.adaptive_avg_pool2d(image.float(), _GRID)
+        return PointMass(torch.cat([means, means[:, :1]], dim=1))
 
-    monkeypatch.setattr(prepare_data, "encode_image", encode)
-    output = tmp_path / "prepared"
-    assert prepare_data.prepare(tmp_path / "raw", output, device="meta") == 1
-    assert prepare_data.prepare(tmp_path / "raw", output, device="meta") == 1
-    assert devices == [torch.device("meta"), torch.device("meta")]
-    image_path = output / "images/00000/img00000000.png"
-    latent_path = output / "vae-in/00000/img-latents-00000000.npy"
-    assert image_path.exists()
-    assert latent_path.exists()
-    with Image.open(image_path) as prepared_image:
-        assert prepared_image.size == (256, 256)
-        assert prepared_image.mode == "RGB"
-        assert prepared_image.getpixel((128, 128)) == (128, 128, 128)
-    latent = load_array(latent_path, np.float32)
-    assert latent.shape == (1, 32, 16, 16)
-    manifest = json_loads(
-        (output / "vae-in/dataset.json").read_text(),
-        dict[str, object],
-    )
-    assert manifest["labels"] == [["00000/img-latents-00000000.npy", 0]]
-    dataset = PairedImageLatentDataset.Config(working_dir=output).make()
-    assert len(dataset) == 1
-    assert dataset[0]["label"] == 0
+    def decode(self, latent: Tensor, /) -> Tensor:
+        """Return a flat image of the first three channels' means."""
+        means = latent[:, :3].mean(dim=(2, 3), keepdim=True)
+        return (means / 255).expand(-1, -1, _SIZE, _SIZE)
+
+    @override
+    def forward(self, image: Tensor) -> Tensor:
+        return self.encode(image).mode()
 
 
-def test_the_invae_pin_is_a_commit_and_a_digest() -> None:
-    assert re.fullmatch(r"[0-9a-f]{40}", prepare_data.INVAE_REVISION)
-    assert re.fullmatch(r"[0-9a-f]{64}", prepare_data.INVAE_SHA256)
+def _gradient(size: tuple[int, int]) -> Image.Image:
+    """Return an RGB image whose every pixel differs, so a misplaced crop shows."""
+    image = Image.new("RGB", size)
+    for x in range(image.width):
+        for y in range(image.height):
+            image.putpixel((x, y), (x * 18, y * 18, (x + y) * 9))
+    return image
 
 
-def test_invae_checkpoint_downloads_the_pinned_revision(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    downloaded = tmp_path / "e2e-invae-400k.pt"
-    downloaded.write_bytes(b"weights")
-    download = Mock(return_value=str(downloaded))
-    monkeypatch.setattr(prepare_data, "hf_hub_download", download)
-    monkeypatch.setattr(
-        prepare_data,
-        "INVAE_SHA256",
-        hashlib.sha256(b"weights").hexdigest(),
-    )
-
-    assert prepare_data.invae_checkpoint(None) == downloaded
-    download.assert_called_once_with(
-        repo_id="REPA-E/e2e-invae",
-        filename="e2e-invae-400k.pt",
-        revision=prepare_data.INVAE_REVISION,
-    )
+def _synsets() -> list[str]:
+    """Return the 1,000 ImageNet synsets in the shipped label order."""
+    labels = _CWD.parents[2] / "data/processors/labels_imagenet.txt"
+    return labels.read_text(encoding="utf-8").splitlines()
 
 
-def test_invae_checkpoint_refuses_a_copy_with_another_digest(tmp_path: Path) -> None:
-    local = tmp_path / "copy.pt"
-    local.write_bytes(b"other bytes")
-    with pytest.raises(ValueError, match="not the pinned"):
-        prepare_data.invae_checkpoint(local)
+def _imagenet(root: Path, count: int) -> Path:
+    """Write ``count`` distinct training JPEGs under the first synset."""
+    synset = _synsets()[0]
+    directory = root / "raw" / "train" / synset
+    directory.mkdir(parents=True)
+    for index in range(count):
+        colour = (40 * index, 64, 32)
+        Image.new("RGB", (40, 30), colour).save(directory / f"{synset}_{index}.JPEG")
+    return root / "raw"
+
+
+def _source(root: Path, **fields: object) -> PairedImageLatentDataset.Config:
+    config = PairedImageLatentDataset.Config(working_dir=root / "corpus")
+    config.autoencoder = _MeanAutoencoder.Config()
+    for name, value in fields.items():
+        setattr(config, name, value)
+    return config
+
+
+def _receipt(config: PairedImageLatentDataset.Config) -> dict[str, object]:
+    path = Path(config.working_dir) / config.latent_subdir / RECEIPT
+    return json_loads(path.read_text(), dict[str, object])
 
 
 if __name__ == "__main__":
