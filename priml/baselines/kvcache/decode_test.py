@@ -200,7 +200,7 @@ def test_rejects_an_unmeasurable_config(
         cfg.make()
 
 
-def test_an_accelerator_step_is_bracketed_by_synchronization(
+def test_synchronize_waits_on_an_accelerator_and_skips_the_cpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     synchronized: list[torch.device] = []
@@ -233,7 +233,7 @@ def test_greedy_decode_bfb() -> None:
     cfg.model.num_layers = 1
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
-        golden_name="greedy_decode",
+        golden_name="decode",
         build_module=cfg.model.make,
         build_input=_prompt,
         run=_decode_tokens,

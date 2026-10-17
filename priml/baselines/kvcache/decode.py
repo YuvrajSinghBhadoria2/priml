@@ -18,8 +18,9 @@ dequantizes in bursts stalls some steps and not others.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 import logging
 import math
@@ -34,8 +35,9 @@ import torch
 from priml.cost import Cost, cost, utilization
 from priml.math.seed import set_seed_local
 from priml.model.attention.attention import Attention
-from priml.model.attention.kvcache import HasModules, KVCache, alloc_layer_cache
+from priml.model.attention.kvcache import KVCache, alloc_layer_cache
 from priml.model.attention.rope import RoPE
+from priml.model.custom_types import DepthIndex
 from priml.model.embedding import Embedding
 from priml.model.linear import Linear
 from priml.model.norm import RMSNorm
@@ -45,7 +47,7 @@ from priml.model.transformer.transformer import Transformer
 
 
 if TYPE_CHECKING:
-    from priml.model.custom_types import DepthIndex, LayerCache
+    from priml.model.custom_types import LayerCache
 
 
 logger = logging.getLogger(__name__)
@@ -60,19 +62,12 @@ __all__ = [
 ]
 
 
-class CacheAllocator(Protocol):
-    """Builds an empty per-layer decode cache for ``model``."""
+type CacheAllocator = Callable[..., dict[DepthIndex, object]]
+"""Builds an empty per-layer decode cache.
 
-    def __call__(
-        self,
-        model: HasModules,
-        *,
-        batch: int,
-        max_seq: int,
-        device: torch.device,
-    ) -> dict[DepthIndex, object]:
-        """Allocate one empty state per cached attention, keyed by depth index."""
-        ...
+Called as ``allocate(model, batch=, max_seq=, device=)``; returns one empty
+state per cached attention, keyed by depth index.
+"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -185,10 +180,10 @@ def greedy_decode(
     seconds: list[float] = []
     with torch.inference_mode():
         tokens = [prompt]
-        for step in range(num_steps + 1):
+        for _ in range(num_steps + 1):
             _synchronize(prompt.device)
             started = time.perf_counter()
-            logits = model(tokens[-1] if step else prompt, cache=cache)
+            logits = model(tokens[-1], cache=cache)
             tokens.append(logits[:, -1:].argmax(dim=-1))
             _synchronize(prompt.device)
             seconds.append(time.perf_counter() - started)
