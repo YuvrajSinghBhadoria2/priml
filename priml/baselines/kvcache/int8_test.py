@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Final
+from functools import partial
+from typing import TYPE_CHECKING, Final
+
+from torch import Tensor
 
 import pytest
 import torch
@@ -24,6 +27,11 @@ from priml.baselines.kvcache.int8 import (
     int8_layer_cache,
 )
 from priml.model.attention.kvcache import KVCache, alloc_layer_cache
+from priml.model.attention.mla import MultiHeadLatentAttention
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 _NUM_HEADS: Final = 3
@@ -104,6 +112,103 @@ def test_update_answers_in_the_incoming_dtype() -> None:
 
     assert k_all.dtype is torch.bfloat16
     assert v_all.dtype is torch.bfloat16
+
+
+@pytest.mark.parametrize("channels", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("length", [0, 1, 2])
+def test_scale_unpacking_handles_every_row_alignment(
+    channels: int,
+    length: int,
+) -> None:
+    cache = Int8KVCache(
+        k=torch.zeros(1, 1, 2, channels + SCALE_COLUMNS, dtype=torch.int8),
+        v=torch.zeros(1, 1, 2, channels + SCALE_COLUMNS, dtype=torch.int8),
+        length=0,
+    )
+    incoming = torch.ones(1, 1, length, channels)
+
+    k_all, v_all = cache.update(incoming, incoming)
+
+    torch.testing.assert_close(k_all, incoming, rtol=0, atol=0)
+    torch.testing.assert_close(v_all, incoming, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [(torch.float16, 1e-6), (torch.bfloat16, 2e-38), (torch.float64, 1e39)],
+)
+def test_dequantization_preserves_the_inputs_dynamic_range(
+    dtype: torch.dtype,
+    value: float,
+) -> None:
+    cache = _cache()
+    incoming = torch.full((2, _NUM_HEADS, 2, CHANNELS_HEAD), value, dtype=dtype)
+
+    k_all, v_all = cache.update(incoming, incoming)
+
+    torch.testing.assert_close(k_all, incoming, rtol=1 / 127, atol=0)
+    torch.testing.assert_close(v_all, incoming, rtol=1 / 127, atol=0)
+
+
+def test_channel_broadcasting_matches_the_float_cache_after_eviction() -> None:
+    cache = _cache(max_seq=2)
+    control = KVCache.alloc(
+        batch=2,
+        num_heads=_NUM_HEADS,
+        max_seq=2,
+        channels_head=CHANNELS_HEAD,
+    )
+    initial = torch.ones(2, _NUM_HEADS, 2, CHANNELS_HEAD)
+    keys = torch.full((2, _NUM_HEADS, 1, CHANNELS_HEAD), 2.0)
+    values = torch.full((2, _NUM_HEADS, 1, 1), 3.0)
+    cache.update(initial, initial)
+    control.update(initial, initial)
+
+    actual = cache.update(keys, values)
+    expected = control.update(keys, values)
+
+    for actual_half, expected_half in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_half, expected_half, rtol=0, atol=0)
+    assert (cache.length, cache.seen) == (control.length, control.seen)
+
+
+@pytest.mark.parametrize("batch", [2, (2, 1)])
+def test_alloc_builds_packed_storage_with_independent_key_and_value_widths(
+    batch: int | tuple[int, ...],
+) -> None:
+    cache = Int8KVCache.alloc(
+        batch=batch,
+        num_heads=_NUM_HEADS,
+        max_seq=5,
+        channels_head=5,
+        channels_v_head=3,
+        dtype=torch.float64,
+    )
+    batch_shape = (batch,) if isinstance(batch, int) else batch
+    assert isinstance(cache, Int8KVCache)
+    assert cache.k.dtype is torch.int8
+    assert cache.v.dtype is torch.int8
+    assert cache.k.shape == (*batch_shape, _NUM_HEADS, 5, 5 + SCALE_COLUMNS)
+    assert cache.v.shape == (*batch_shape, _NUM_HEADS, 5, 3 + SCALE_COLUMNS)
+    assert (cache.length, cache.seen) == (0, 0)
+    keys = torch.ones(*batch_shape, _NUM_HEADS, 1, 5)
+    values = torch.ones(*batch_shape, _NUM_HEADS, 1, 3)
+
+    k_all, v_all = cache.update(keys, values)
+
+    torch.testing.assert_close(k_all, keys, rtol=0, atol=0)
+    torch.testing.assert_close(v_all, values, rtol=0, atol=0)
+
+
+def test_quantization_keeps_nan_visible_to_attention() -> None:
+    cache = _cache()
+    incoming = torch.ones(2, _NUM_HEADS, 2, CHANNELS_HEAD)
+    incoming[..., 0] = torch.nan
+
+    k_all, v_all = cache.update(incoming, incoming)
+
+    assert torch.isnan(k_all).any(dim=-1).all()
+    assert torch.isnan(v_all).any(dim=-1).all()
 
 
 def test_fifo_shift_keeps_codes_and_scales_aligned() -> None:
@@ -190,6 +295,85 @@ def test_int8_layer_cache_widens_every_slot_the_model_allocates() -> None:
         assert state.seen == 0
 
 
+@pytest.mark.parametrize("model_device", ["cpu", "meta"])
+@pytest.mark.parametrize("cache_device", ["cpu", "meta"])
+def test_layer_allocator_honors_the_requested_device(
+    model_device: str,
+    cache_device: str,
+) -> None:
+    model = _tiny().model.make().to(device=model_device)
+
+    caches = int8_layer_cache(model, batch=2, max_seq=4, device=cache_device)
+
+    for state in caches.values():
+        assert isinstance(state, Int8KVCache)
+        assert state.k.device == torch.device(cache_device)
+        assert state.v.device == torch.device(cache_device)
+
+
+def test_layer_allocator_allocates_only_the_packed_cache_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _tiny().model.make()
+    allocations: list[int] = []
+    monkeypatch.setattr(
+        torch,
+        "zeros",
+        partial(_record_allocation, make=torch.zeros, allocations=allocations),
+    )
+
+    caches = int8_layer_cache(model, batch=2, max_seq=4)
+
+    assert sum(allocations) == _cache_bytes(caches)
+
+
+def test_layer_allocator_preserves_asymmetric_latent_cache_widths() -> None:
+    cfg = MultiHeadLatentAttention.Config()
+    cfg.channels_in = 8
+    cfg.num_heads = 2
+    cfg.channels_qk_nope_head = 4
+    cfg.channels_qk_rope_head = 2
+    cfg.channels_v_head = 4
+    cfg.kv_lora_rank = 3
+    cfg.depth_index = ((0, 1),)
+    model = cfg.make()
+
+    caches = int8_layer_cache(model, batch=1, max_seq=4)
+    state = caches[cfg.depth_index]
+    assert isinstance(state, Int8KVCache)
+    assert state.k.shape == (1, 1, 4, cfg.kv_lora_rank + SCALE_COLUMNS)
+    assert state.v.shape == (1, 1, 4, cfg.channels_qk_rope_head + SCALE_COLUMNS)
+    output = model(torch.ones(1, 1, cfg.channels_in), cache=caches)
+
+    assert output.shape == (1, 1, cfg.channels_in)
+    assert torch.isfinite(output).all()
+    assert state.length == 1
+
+
+@pytest.mark.parametrize("failure", ["length", "capacity", "shape"])
+def test_rejected_updates_preserve_storage_and_progress(failure: str) -> None:
+    cache = _cache(max_seq=2)
+    initial = torch.ones(2, _NUM_HEADS, 2, CHANNELS_HEAD)
+    cache.update(initial, initial)
+    keys_before = cache.k.clone()
+    values_before = cache.v.clone()
+    keys = torch.ones(2, _NUM_HEADS, 1, CHANNELS_HEAD)
+    values = keys
+    if failure == "length":
+        values = initial
+    elif failure == "capacity":
+        keys = values = torch.ones(2, _NUM_HEADS, 3, CHANNELS_HEAD)
+    else:
+        values = torch.ones(2, _NUM_HEADS + 1, 1, CHANNELS_HEAD)
+
+    with pytest.raises(ValueError, match=r"keys and|capacity|Cannot write"):
+        cache.update(keys, values)
+
+    torch.testing.assert_close(cache.k, keys_before, rtol=0, atol=0)
+    torch.testing.assert_close(cache.v, values_before, rtol=0, atol=0)
+    assert (cache.length, cache.seen) == (2, 2)
+
+
 def test_update_refuses_a_width_the_cache_cannot_hold() -> None:
     cache = _cache()
     too_wide = torch.zeros(
@@ -231,3 +415,22 @@ def test_the_prompt_the_end_to_end_run_feeds_is_still_exp000s() -> None:
     report = cfg.make().measure()
 
     assert torch.equal(report.tokens[:, :PROMPT_LEN], _prompt())
+
+
+def _record_allocation(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+    make: Callable[..., Tensor],
+    allocations: list[int],
+) -> Tensor:
+    tensor = make(shape, device=device, dtype=dtype)
+    allocations.append(tensor.nbytes)
+    return tensor
+
+
+if __name__ == "__main__":
+    from priml.lib.testing.runner import test_main
+
+    test_main(__file__)

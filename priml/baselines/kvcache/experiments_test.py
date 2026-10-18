@@ -9,6 +9,7 @@ departure from ``exp000`` is the cache allocator.
 from __future__ import annotations
 
 from priml.baselines.kvcache.experiments import exp000, exp001
+from priml.baselines.kvcache.int8 import int8_layer_cache
 from priml.testing.golden import assert_pprint_golden
 
 
@@ -31,26 +32,11 @@ def test_exp001_decodes_to_a_4096_token_context() -> None:
 
 
 def test_exp001_changes_only_the_cache_allocator() -> None:
-    forked = (
-        exp001()
-        .pformat(
-            finalize=True,
-            mask_memory_addresses=True,
-            hide_default_values=False,
-            width=80,
-        )
-        .replace(
-            "priml.baselines.kvcache.int8.int8_layer_cache",
-            "priml.model.attention.kvcache.alloc_layer_cache",
-        )
-    )
-    control = exp000().pformat(
-        finalize=True,
-        mask_memory_addresses=True,
-        hide_default_values=False,
-        width=80,
-    )
-    assert forked == control
+    forked = exp001()
+    control = exp000()
+    assert forked.allocate_cache is int8_layer_cache
+    forked.allocate_cache = control.allocate_cache
+    assert forked.udiff(control) == ""
 
 
 if __name__ == "__main__":

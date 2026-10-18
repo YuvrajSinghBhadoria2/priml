@@ -49,6 +49,48 @@ class Int8KVCache(KVCache):
 
     __slots__ = ()
 
+    @classmethod
+    @override
+    def alloc(
+        cls,
+        *,
+        batch: int | tuple[int, ...],
+        num_heads: int,
+        max_seq: int,
+        channels_head: int,
+        channels_v_head: int | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> KVCache:
+        """Allocate packed int8 rows, including each row's float32 scale.
+
+        Args:
+          batch: Batch size or batch shape.
+          num_heads: Number of cached heads.
+          max_seq: Maximum sequence length.
+          channels_head: Key channels per head, excluding the packed scale.
+          channels_v_head: Value channels per head; defaults to key channels.
+          device: Device for allocated tensors.
+          dtype: Accepted for the base allocator contract; storage is int8.
+
+        Returns:
+          cache: An empty packed cache with zero length and tokens seen.
+
+        """
+        del dtype
+        return super().alloc(
+            batch=batch,
+            num_heads=num_heads,
+            max_seq=max_seq,
+            channels_head=channels_head + SCALE_COLUMNS,
+            channels_v_head=(
+                channels_head if channels_v_head is None else channels_v_head
+            )
+            + SCALE_COLUMNS,
+            device=device,
+            dtype=torch.int8,
+        )
+
     @override
     def freeze(self) -> KVCache:
         """Refuse a frozen view, which would serve raw codes to attention.
@@ -94,6 +136,7 @@ class Int8KVCache(KVCache):
             raise ValueError(
                 f"Update length {s} exceeds cache capacity {self.max_seq}.",
             )
+        packed: list[Tensor] = []
         for new, store in ((k, self.k), (v, self.v)):
             slot = store[..., :s, :-SCALE_COLUMNS].shape
             try:
@@ -105,6 +148,7 @@ class Int8KVCache(KVCache):
                     f"Cannot write {tuple(new.shape)} into the cache's "
                     f"{tuple(slot)} slot.",
                 )
+            packed.append(_quantize(new.expand(slot)))
         overflow = self.length + s - self.max_seq
         if overflow > 0:
             keep = self.length - overflow
@@ -112,11 +156,8 @@ class Int8KVCache(KVCache):
             self.v[..., :keep, :] = self.v[..., overflow : self.length, :].clone()
             self.length = keep
         end = self.length + s
-        if s:
-            codes, scales = _quantize(k)
-            self.k[..., self.length : end, :] = torch.cat((codes, scales), dim=-1)
-            codes, scales = _quantize(v)
-            self.v[..., self.length : end, :] = torch.cat((codes, scales), dim=-1)
+        self.k[..., self.length : end, :] = packed[0]
+        self.v[..., self.length : end, :] = packed[1]
         self.length = end
         self.seen += s
         return (
@@ -156,60 +197,40 @@ def int8_layer_cache(
     allocated = alloc_layer_cache(
         model,
         batch=batch,
-        max_seq=max_seq,
+        max_seq=0,
         device=device,
-        dtype=torch.int8,
     )
     for key, state in allocated.items():
         assert isinstance(state, KVCache)
-        result[key] = Int8KVCache(
-            k=torch.zeros(
-                (*state.k.shape[:-1], state.k.shape[-1] + SCALE_COLUMNS),
-                dtype=torch.int8,
-                device=state.k.device,
-            ),
-            v=torch.zeros(
-                (*state.v.shape[:-1], state.v.shape[-1] + SCALE_COLUMNS),
-                dtype=torch.int8,
-                device=state.v.device,
-            ),
-            length=0,
+        result[key] = Int8KVCache.alloc(
+            batch=tuple(state.k.shape[:-3]),
+            num_heads=state.k.shape[-3],
+            max_seq=max_seq,
+            channels_head=state.k.shape[-1],
+            channels_v_head=state.v.shape[-1],
+            device=state.k.device,
         )
     return result
 
 
-def _quantize(x: Tensor) -> tuple[Tensor, Tensor]:
-    """Turn a float row into int8 codes plus its packed float32 scale.
-
-    Args:
-      x: Incoming keys or values ``[..., seq_len, channels]``.
-
-    Returns:
-      codes: ``[..., seq_len, channels]`` int8, ``x / scale`` rounded.
-      scales: ``[..., seq_len, SCALE_COLUMNS]`` int8 holding the float32
-        scale's bits; an all-zero row stores scale 1, so its codes are 0.
-
-    """
-    scale = x.float().abs().amax(dim=-1, keepdim=True).div(_CODE_MAX)
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    codes = torch.round(x.float().div(scale)).clamp_(-_CODE_MAX, _CODE_MAX)
+def _quantize(x: Tensor) -> Tensor:
+    """Pack a float row as int8 codes followed by its float32 scale."""
+    values = x.to(dtype=torch.promote_types(x.dtype, torch.float32))
+    scale = values.abs().amax(dim=-1, keepdim=True).div(_CODE_MAX)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    codes = torch.round(values.div(scale)).clamp_(-_CODE_MAX, _CODE_MAX)
     codes = codes.to(torch.int8)
-    scales = scale.view(torch.int32).view(torch.int8)
-    return codes, scales
+    return torch.cat((codes, scale.float().view(torch.int8)), dim=-1)
 
 
 def _dequantized(store: Tensor, end: int, dtype: torch.dtype) -> Tensor:
-    """Read the cache's first ``end`` rows back as floats in ``dtype``.
-
-    Args:
-      store: Packed int8 cache ``[..., max_seq, channels + SCALE_COLUMNS]``.
-      end: Number of valid rows to return.
-      dtype: Dtype the attention block reads in.
-
-    Returns:
-      values: ``[..., end, channels]`` dequantized rows in ``dtype``.
-
-    """
+    """Read the cache's first ``end`` rows back as floats in ``dtype``."""
     codes = store[..., :end, :-SCALE_COLUMNS]
-    scale = store[..., :end, -SCALE_COLUMNS:].contiguous().view(torch.float32)
-    return codes.to(dtype) * scale.to(dtype)
+    # A plain clone preserves singleton strides; dtype views also require
+    # divisible strides on those axes, even when no rows are valid yet.
+    scale = (
+        store[..., :end, -SCALE_COLUMNS:]
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.float32)
+    )
+    return (codes.to(torch.promote_types(dtype, torch.float32)) * scale).to(dtype)
