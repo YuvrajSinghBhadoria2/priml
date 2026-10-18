@@ -48,7 +48,7 @@ class KVCache:
         # Total tokens ever written. Unlike ``length`` (capped at
         # ``max_seq`` by FIFO eviction) ``seen`` grows monotonically, so
         # RoPE can keep assigning absolute positions past capacity.
-        self.seen = self.length
+        self.seen: int = self.length
 
     @classmethod
     def alloc(

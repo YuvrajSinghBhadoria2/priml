@@ -2,11 +2,14 @@
 
 ``exp000`` is pinned whole by a pprint golden: its prompts, context length,
 model, and dtype are the control every KV-cache fork is measured against.
+``exp001`` is pinned the same way. A config comparison checks that only its
+cache allocator differs from ``exp000``.
 """
 
 from __future__ import annotations
 
-from priml.baselines.kvcache.experiments import exp000
+from priml.baselines.kvcache.experiments import exp000, exp001
+from priml.baselines.kvcache.int8 import int8_layer_cache
 from priml.testing.golden import assert_pprint_golden
 
 
@@ -17,6 +20,23 @@ def test_exp000_pprint() -> None:
 def test_exp000_decodes_to_a_4096_token_context() -> None:
     cfg = exp000()
     assert cfg.prompt_len + cfg.num_decode_steps == 4096
+
+
+def test_exp001_pprint() -> None:
+    assert_pprint_golden(test_file=__file__, name="exp001", config=exp001())
+
+
+def test_exp001_decodes_to_a_4096_token_context() -> None:
+    cfg = exp001()
+    assert cfg.prompt_len + cfg.num_decode_steps == 4096
+
+
+def test_exp001_changes_only_the_cache_allocator() -> None:
+    forked = exp001()
+    control = exp000()
+    assert forked.allocate_cache is int8_layer_cache
+    forked.allocate_cache = control.allocate_cache
+    assert forked.udiff(control) == ""
 
 
 if __name__ == "__main__":
