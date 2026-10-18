@@ -79,7 +79,7 @@ def exp000() -> DecodeBenchmark.Config:
 
 
 def exp001() -> DecodeBenchmark.Config:
-    """exp000 with one change: the cache stores int8 codes plus a scale.
+    """Store int8 KV rows in the frozen exp000 decode benchmark.
 
     ``allocate_cache`` becomes :func:`int8_layer_cache`: each token's key
     row and value row quantize symmetrically to signed int8 against one

@@ -38,21 +38,6 @@ _NUM_HEADS: Final = 3
 _CODE_MAX: Final = 127.0
 
 
-def _cache(*, batch: int = 2, max_seq: int = 8) -> Int8KVCache:
-    """Build a tiny int8 cache directly from the documented layout."""
-    return Int8KVCache(
-        k=torch.zeros(
-            (batch, _NUM_HEADS, max_seq, CHANNELS_HEAD + SCALE_COLUMNS),
-            dtype=torch.int8,
-        ),
-        v=torch.zeros(
-            (batch, _NUM_HEADS, max_seq, CHANNELS_HEAD + SCALE_COLUMNS),
-            dtype=torch.int8,
-        ),
-        length=0,
-    )
-
-
 def test_int8_cache_counts_its_scales_inside_the_cache_tensors() -> None:
     model = decoder().make()
     max_seq = 64
@@ -415,6 +400,21 @@ def test_the_prompt_the_end_to_end_run_feeds_is_still_exp000s() -> None:
     report = cfg.make().measure()
 
     assert torch.equal(report.tokens[:, :PROMPT_LEN], _prompt())
+
+
+def _cache(*, batch: int = 2, max_seq: int = 8) -> Int8KVCache:
+    """Build a tiny int8 cache directly from the documented layout."""
+    return Int8KVCache(
+        k=torch.zeros(
+            (batch, _NUM_HEADS, max_seq, CHANNELS_HEAD + SCALE_COLUMNS),
+            dtype=torch.int8,
+        ),
+        v=torch.zeros(
+            (batch, _NUM_HEADS, max_seq, CHANNELS_HEAD + SCALE_COLUMNS),
+            dtype=torch.int8,
+        ),
+        length=0,
+    )
 
 
 def _record_allocation(

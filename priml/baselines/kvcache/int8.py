@@ -161,8 +161,8 @@ class Int8KVCache(KVCache):
         self.length = end
         self.seen += s
         return (
-            _dequantized(self.k, end, k.dtype),
-            _dequantized(self.v, end, v.dtype),
+            _dequantized(self.k, end=end, dtype=k.dtype),
+            _dequantized(self.v, end=end, dtype=v.dtype),
         )
 
 
@@ -223,7 +223,7 @@ def _quantize(x: Tensor) -> Tensor:
     return torch.cat((codes, scale.float().view(torch.int8)), dim=-1)
 
 
-def _dequantized(store: Tensor, end: int, dtype: torch.dtype) -> Tensor:
+def _dequantized(store: Tensor, *, end: int, dtype: torch.dtype) -> Tensor:
     """Read the cache's first ``end`` rows back as floats in ``dtype``."""
     codes = store[..., :end, :-SCALE_COLUMNS]
     # A plain clone preserves singleton strides; dtype views also require

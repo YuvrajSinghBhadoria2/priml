@@ -2,8 +2,8 @@
 
 ``exp000`` is pinned whole by a pprint golden: its prompts, context length,
 model, and dtype are the control every KV-cache fork is measured against.
-``exp001`` is pinned the same way, plus a render-level check that its only
-departure from ``exp000`` is the cache allocator.
+``exp001`` is pinned the same way. A config comparison checks that only its
+cache allocator differs from ``exp000``.
 """
 
 from __future__ import annotations
