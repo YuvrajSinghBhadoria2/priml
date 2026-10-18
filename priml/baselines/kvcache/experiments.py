@@ -6,6 +6,7 @@ dtype. Every later experiment forks a named parent and changes ONE thing:
 ``allocate_cache``, the storage the cache uses.
 
     exp000  bf16 weights, bf16 KV cache, 4096-token context
+      +-- exp001  int8 codes, one float32 scale per token, packed in k/v
 
 Launch::
 
@@ -31,6 +32,7 @@ A fork may not change:
 from __future__ import annotations
 
 from priml.baselines.kvcache.decode import DecodeBenchmark
+from priml.baselines.kvcache.int8 import int8_layer_cache
 
 
 def exp000() -> DecodeBenchmark.Config:
@@ -73,4 +75,41 @@ def exp000() -> DecodeBenchmark.Config:
     ]
     cfg.num_decode_steps = 4096 - cfg.prompt_len
     cfg.device = "cuda"
+    return cfg
+
+
+def exp001() -> DecodeBenchmark.Config:
+    """exp000 with one change: the cache stores int8 codes plus a scale.
+
+    ``allocate_cache`` becomes :func:`int8_layer_cache`: each token's key
+    row and value row quantize symmetrically to signed int8 against one
+    scale, and the float32 scale's bits pack into the row's trailing
+    columns, so measured cache bytes count codes and scales together.
+    Attention reads the dequantized slice in the model's dtype, so the
+    model, its dtype, the prompts, the context length, and the harness are
+    exp000's.
+
+    Hypothesis:
+      At a 4096-token context a decode step reads more cache than weights,
+      so decode tokens per second scale with the bytes each cached value
+      occupies. int8 codes with one scale per token move 68/128 of exp000's
+      bf16 bytes per value, so decode runs faster while the greedy tokens
+      stay within the quantization error of the control.
+
+    References:
+      https://arxiv.org/abs/2402.02750
+        Liu et al. 2024. KIVI: A tuning-free asymmetric 2bit quantization
+        for KV cache. KIVI's per-token value granularity motivates this
+        fork's scale; KIVI quantizes keys per channel at 2 bits, while this
+        fork keeps both halves per-token at 8 bits as the first rung.
+
+    Results:
+      TBD.
+
+    Returns:
+      config: exp000 with the int8 cache allocator.
+
+    """
+    cfg = exp000()
+    cfg.allocate_cache = int8_layer_cache
     return cfg
