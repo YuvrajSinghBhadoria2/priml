@@ -248,7 +248,6 @@ class Fp4TritonAttention(nn.Module):
             seq=seq,
             length=length,
             channels=channels,
-            code_width=channels // 2,
             block_l=self.block_l,
             block_s=block_s,
             causal=is_causal,
@@ -359,7 +358,6 @@ def _fp4_attention_forward_triton(  # noqa: PLR0917 -- The signature is the kern
     seq: language.constexpr,
     length: int,
     channels: language.constexpr,
-    code_width: language.constexpr,
     block_l: language.constexpr,
     block_s: language.constexpr,
     causal: language.constexpr,
@@ -381,18 +379,20 @@ def _fp4_attention_forward_triton(  # noqa: PLR0917 -- The signature is the kern
     m = language.full((block_s,), float("-inf"), dtype=language.float32)
     lse = language.zeros((block_s,), dtype=language.float32)
     lc = language.arange(0, block_l)
-    wc = language.arange(0, code_width)
     for start in range(0, length, block_l):
         j = start + lc
         valid = j < length
         codes = language.load(
-            k_ptr + b * k_b + h * k_h + j[:, None] * k_l + wc,
+            k_ptr + b * k_b + h * k_h + j[:, None] * k_l + d[None, :] // 2,
             mask=valid[:, None],
             other=0,
         )
-        high = language.load(table_ptr + (codes.to(language.int32) >> 4))
-        low = language.load(table_ptr + (codes.to(language.int32) & 15))
-        key = language.reshape(language.join(high, low), block_l, channels)
+        index = language.where(
+            (d[None, :] & 1) == 0,
+            codes.to(language.int32) >> 4,
+            codes.to(language.int32) & 15,
+        )
+        key = language.load(table_ptr + index)
         scale = language.load(
             ks_ptr + b * ks_b + h * ks_h + j * ks_l,
             mask=valid,
@@ -413,13 +413,16 @@ def _fp4_attention_forward_triton(  # noqa: PLR0917 -- The signature is the kern
         p = language.exp(logits - m_new[:, None])
         acc = acc * alpha[:, None]
         vcodes = language.load(
-            v_ptr + b * v_b + h * v_h + j[:, None] * v_l + wc,
+            v_ptr + b * v_b + h * v_h + j[:, None] * v_l + d[None, :] // 2,
             mask=valid[:, None],
             other=0,
         )
-        vhigh = language.load(table_ptr + (vcodes.to(language.int32) >> 4))
-        vlow = language.load(table_ptr + (vcodes.to(language.int32) & 15))
-        value = language.reshape(language.join(vhigh, vlow), block_l, channels)
+        vindex = language.where(
+            (d[None, :] & 1) == 0,
+            vcodes.to(language.int32) >> 4,
+            vcodes.to(language.int32) & 15,
+        )
+        value = language.load(table_ptr + vindex)
         vscale = language.load(
             vs_ptr + b * vs_b + h * vs_h + j * vs_l,
             mask=valid,

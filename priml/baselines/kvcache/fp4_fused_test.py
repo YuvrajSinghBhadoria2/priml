@@ -160,7 +160,6 @@ def test_supported_tiles_compile_for_sm80_without_a_gpu(
         "heads": 3,
         "seq": 5,
         "channels": channels,
-        "code_width": channels // 2,
         "block_l": block_l,
         "block_s": 16,
         "causal": True,
