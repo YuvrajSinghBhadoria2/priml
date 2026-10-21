@@ -18,6 +18,7 @@ from priml.baselines.kvcache.decode import (
     DecodeReport,
     _synchronize,
     greedy_decode,
+    token_agreement,
 )
 from priml.cost import Cost, cost
 from priml.model.attention.attention import Attention
@@ -226,6 +227,24 @@ def test_run_logs_the_rates(caplog: pytest.LogCaptureFixture) -> None:
     assert any(m.startswith("decode step ms: p99 ") for m in messages)
     assert any(m.startswith("kv cache bytes: ") for m in messages)
     assert any(m.startswith("rtx5090 roofline utilization:") for m in messages)
+
+
+def test_token_agreement_is_one_for_identical_streams() -> None:
+    tokens = torch.tensor([[1, 2, 3], [4, 5, 6]])
+
+    assert token_agreement(tokens, tokens) == 1.0
+
+
+def test_token_agreement_counts_positions_over_every_row() -> None:
+    control = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+    candidate = torch.tensor([[1, 9, 3, 4], [5, 6, 0, 8]])
+
+    assert token_agreement(control, candidate) == 0.75
+
+
+def test_token_agreement_rejects_misaligned_streams() -> None:
+    with pytest.raises(ValueError, match="one to one"):
+        token_agreement(torch.zeros(2, 3), torch.zeros(2, 4))
 
 
 def test_greedy_decode_bfb() -> None:

@@ -59,6 +59,7 @@ __all__ = [
     "DecodeReport",
     "decoder",
     "greedy_decode",
+    "token_agreement",
 ]
 
 
@@ -357,6 +358,31 @@ class DecodeBenchmark:
                     duration_sec=sum(report.step_sec),
                 ),
             )
+
+
+def token_agreement(control: Tensor, candidate: Tensor) -> float:
+    """Fraction of positions two greedy token streams take the same token.
+
+    A decode report holds the prompt too, which both runs share as input;
+    comparing ``report.tokens[:, prompt_len:]`` scores the choices alone.
+
+    Args:
+      control: ``(batch, positions)`` greedy tokens from the control run.
+      candidate: ``(batch, positions)`` tokens from the run under test.
+
+    Returns:
+      fraction: Same-token positions, over every batch row and position.
+
+    Raises:
+      ValueError: The two streams differ in shape.
+
+    """
+    if control.shape != candidate.shape:
+        raise ValueError(
+            f"Got {tuple(control.shape)} control and {tuple(candidate.shape)} "
+            "candidate tokens; agreement pairs positions one to one.",
+        )
+    return (control == candidate).float().mean().item()
 
 
 def _synchronize(device: torch.device) -> None:
