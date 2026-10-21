@@ -248,10 +248,16 @@ def exp003() -> DecodeBenchmark.Config:
       exp001 and recovers only ~13% of the gap to exp000, so the
       dequantized copy was not the dominant per-step cost. Kernel output
       matches the materialized path to bf16 rounding (max abs diff 0.00195
-      against SDPA over _dequantized rows under the ladder's masks). The
-      ladder's speed inversion
-      is dominated by what quantization adds around the read: the
-      per-step pack, the head-expansion copies, and launch overhead.
+      against SDPA over _dequantized rows under the ladder's masks).
+      A follow-up probe removed the GQA head expansion as well
+      (``num_heads_kv = 8``, ``kv_groups = 1``, same seed): 703.4-705.9
+      tokens/sec -- +1.9% over exp003, still ~36% under exp000's same-
+      session 1106-1109. Both candidate read-path costs are therefore
+      exonerated: at this batch and model size the step is CPU/launch-bound
+      (per-step KV reads are only ``bytes/token x context`` -- single-digit
+      MB -- against 45 MB of weights), and the gap is what the quantized
+      write path costs the CPU: the per-step pack kernels, tensor reshapes,
+      and their launches, none of which any read-path change can remove.
 
     Returns:
       config: exp000 with the packed-served fp4 cache and the fused Triton
