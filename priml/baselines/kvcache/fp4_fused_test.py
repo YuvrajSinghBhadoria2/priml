@@ -6,6 +6,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import inspect
+import math
 
 import pytest
 import torch
@@ -269,6 +270,32 @@ def test_uniform_attention_matches_known_values_across_tile_boundaries(
 
 
 @pytest.mark.gpu_triton
+@pytest.mark.parametrize("length", [7, 131])
+@pytest.mark.parametrize("high_tail", [False, True])
+def test_known_nonuniform_logits_weight_the_final_rows(
+    length: int,
+    high_tail: bool,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    q = torch.zeros(2, 5, 3, 16, dtype=torch.bfloat16, device="cuda")
+    q[..., 0] = 1
+    keys = torch.zeros(2, length, 3, 16, dtype=torch.bfloat16, device="cuda")
+    keys[..., 1] = 6
+    keys[:, -3:, :, 0] = 6 if high_tail else 0
+    keys[:, :-3, :, 0] = 0 if high_tail else 6
+    values = torch.zeros_like(keys)
+    values[:, -3:] = 1
+    tail = 3 * (math.exp(1.5) if high_tail else 1)
+    prefix = (length - 3) * (1 if high_tail else math.exp(1.5))
+    expected = torch.full_like(q, tail / (prefix + tail))
+
+    actual = Fp4TritonAttention.Config().make()(q, _quantize(keys), _quantize(values))
+
+    assert (actual - expected).abs().max().item() < 0.02, (actual, expected)
+
+
+@pytest.mark.gpu_triton
 @pytest.mark.parametrize("block_l", [16, 128])
 @pytest.mark.parametrize(
     ("seq", "causal"),
@@ -288,7 +315,21 @@ def test_kernel_matches_sdpa_over_dequantized_rows(
 
     out = attention(q, k, v, is_causal=causal)
     expected = _reference(q, k, v, causal=causal)
+    key = _dequantized(k, end=k.shape[1], channels=q.shape[-1], dtype=torch.bfloat16)
+    value = _dequantized(v, end=v.shape[1], channels=q.shape[-1], dtype=torch.bfloat16)
+    logits = q.float().movedim(-3, -2) @ key.float().movedim(-3, -2).transpose(-1, -2)
+    logits *= q.shape[-1] ** -0.5
+    if causal:
+        query_rows = torch.arange(k.shape[1] - seq, k.shape[1], device=q.device)
+        keys = torch.arange(k.shape[1], device=q.device)
+        logits.masked_fill_(keys[None, :] > query_rows[:, None], float("-inf"))
+    manual = (
+        (logits.softmax(dim=-1) @ value.float().movedim(-3, -2))
+        .movedim(-3, -2)
+        .to(q.dtype)
+    )
 
+    assert (expected - manual).abs().max().item() < 0.02
     assert (out - expected).abs().max().item() < 0.02
 
 
