@@ -14,6 +14,7 @@ from priml.baselines.kvcache.decode import _cache_bytes
 from priml.baselines.kvcache.decode_test import _tiny
 from priml.baselines.kvcache.experiments import exp003
 from priml.baselines.kvcache.fp4 import (
+    _CODE_VALUES,
     SCALE_COLUMNS,
     _dequantized,
     _packed,
@@ -244,15 +245,46 @@ def test_fused_allocator_rejects_unsupported_attention_before_allocation(
 
 
 @pytest.mark.gpu_triton
+@pytest.mark.parametrize("length", [7, 127, 128, 131])
+def test_uniform_attention_matches_known_values_across_tile_boundaries(
+    length: int,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    q = torch.zeros(2, 5, 3, 16, dtype=torch.bfloat16, device="cuda")
+    codes = torch.tensor(_CODE_VALUES, dtype=torch.bfloat16, device="cuda")
+    exponents = (
+        torch.arange(2, device="cuda")[:, None, None]
+        + torch.arange(length, device="cuda")[None, :, None] % 3
+        + torch.arange(3, device="cuda")[None, None, :]
+    )
+    values = codes * (2.0**exponents)[..., None]
+    k = _quantize(torch.zeros_like(values))
+    v = _quantize(values)
+    expected = values.float().mean(dim=1, keepdim=True).expand_as(q).to(q.dtype)
+
+    actual = Fp4TritonAttention.Config().make()(q, k, v)
+
+    assert torch.equal(actual, expected), (actual, expected)
+
+
+@pytest.mark.gpu_triton
+@pytest.mark.parametrize("block_l", [16, 128])
 @pytest.mark.parametrize(
     ("seq", "causal"),
     [(1, False), (1, True), (4, True)],
     ids=["decode", "decode-causal", "prefill"],
 )
-def test_kernel_matches_sdpa_over_dequantized_rows(seq: int, causal: bool) -> None:
+def test_kernel_matches_sdpa_over_dequantized_rows(
+    seq: int,
+    causal: bool,
+    block_l: int,
+) -> None:
     # greedy_decode feeds logits[:, -1:] after prefill, so decode has one query.
     q, k, v = _cuda_case(seq=seq)
-    attention = Fp4TritonAttention.Config().make()
+    config = Fp4TritonAttention.Config()
+    config.block_l = block_l
+    attention = config.make()
 
     out = attention(q, k, v, is_causal=causal)
     expected = _reference(q, k, v, causal=causal)

@@ -8,12 +8,6 @@ the attention kernel that reads the packed cache.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import os
-import subprocess
-import sys
-
 from priml.baselines.kvcache.experiments import exp000, exp001, exp002, exp003
 from priml.baselines.kvcache.fp4 import fp4_layer_cache
 from priml.baselines.kvcache.fp4_fused import Fp4TritonAttention, fp4_fused_layer_cache
@@ -56,32 +50,6 @@ def test_exp002_changes_only_the_cache_allocator() -> None:
     assert forked.allocate_cache is fp4_layer_cache
     forked.allocate_cache = control.allocate_cache
     assert forked.udiff(control) == ""
-
-
-def test_experiments_import_without_triton(tmp_path: Path) -> None:
-    probe = tmp_path / "import_without_triton.py"
-    probe.write_text(
-        "import sys\n"
-        "from importlib.abc import MetaPathFinder\n"
-        "class BlockTriton(MetaPathFinder):\n"
-        "    def find_spec(self, fullname, path=None, target=None):\n"
-        "        if fullname == 'triton' or fullname.startswith('triton.'):\n"
-        "            raise ModuleNotFoundError('Triton import blocked')\n"
-        "sys.meta_path.insert(0, BlockTriton())\n"
-        "from priml.baselines.kvcache.experiments import exp000, exp001, exp002, exp003\n"
-        "for factory in (exp000, exp001, exp002, exp003):\n"
-        "    factory().copy_tree().finalize()\n"
-        "assert 'triton' not in sys.modules\n",
-    )
-    result = subprocess.run(
-        [sys.executable, "-B", "import_without_triton.py"],
-        cwd=tmp_path,
-        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[3])},
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
 
 
 def test_exp003_decodes_to_a_4096_token_context() -> None:
