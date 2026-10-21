@@ -60,7 +60,7 @@ _SCALE_CODE_BYTES = 4
 
 
 @jit_kernel
-def _fp4_attention_forward(
+def _fp4_attention_forward(  # noqa: PLR0917 -- The signature is the kernel's positional ABI.
     q_ptr: language.tensor,
     k_ptr: language.tensor,
     v_ptr: language.tensor,
@@ -68,24 +68,24 @@ def _fp4_attention_forward(
     vs_ptr: language.tensor,
     out_ptr: language.tensor,
     table_ptr: language.tensor,
-    q_b,
-    q_s,
-    q_h,
-    k_b,
-    k_h,
-    k_l,
-    v_b,
-    v_h,
-    v_l,
-    ks_b,
-    ks_h,
-    ks_l,
-    vs_b,
-    vs_h,
-    vs_l,
-    out_b,
-    out_s,
-    out_h,
+    q_b: int,
+    q_s: int,
+    q_h: int,
+    k_b: int,
+    k_h: int,
+    k_l: int,
+    v_b: int,
+    v_h: int,
+    v_l: int,
+    ks_b: int,
+    ks_h: int,
+    ks_l: int,
+    vs_b: int,
+    vs_h: int,
+    vs_l: int,
+    out_b: int,
+    out_s: int,
+    out_h: int,
     heads: language.constexpr,
     seq: language.constexpr,
     length: int,
@@ -120,9 +120,9 @@ def _fp4_attention_forward(
             mask=valid[:, None],
             other=0,
         )
-        high = language.load(table_ptr + (codes >> 4))
-        low = language.load(table_ptr + (codes & 15))
-        key = language.join(high, low).reshape(block_l, channels)
+        high = language.load(table_ptr + (codes.to(language.int32) >> 4))
+        low = language.load(table_ptr + (codes.to(language.int32) & 15))
+        key = language.reshape(language.join(high, low), block_l, channels)
         scale = language.load(
             ks_ptr + b * ks_b + h * ks_h + j * ks_l,
             mask=valid,
@@ -143,9 +143,9 @@ def _fp4_attention_forward(
             mask=valid[:, None],
             other=0,
         )
-        vhigh = language.load(table_ptr + (vcodes >> 4))
-        vlow = language.load(table_ptr + (vcodes & 15))
-        value = language.join(vhigh, vlow).reshape(block_l, channels)
+        vhigh = language.load(table_ptr + (vcodes.to(language.int32) >> 4))
+        vlow = language.load(table_ptr + (vcodes.to(language.int32) & 15))
+        value = language.reshape(language.join(vhigh, vlow), block_l, channels)
         vscale = language.load(
             vs_ptr + b * vs_b + h * vs_h + j * vs_l,
             mask=valid,
@@ -155,7 +155,7 @@ def _fp4_attention_forward(
         acc += language.dot(p.to(language.bfloat16), value)
         lse = lse * alpha + language.sum(p, 1)
         m = m_new
-    out = (acc / lse[:, None]).to(language.bfloat16)
+    out = acc / lse[:, None]
     language.store(
         out_ptr + b * out_b + s[:, None] * out_s + h * out_h + d,
         out,
@@ -165,7 +165,7 @@ def _fp4_attention_forward(
 
 @lru_cache(maxsize=8)
 def _code_table(device: torch.device) -> Tensor:
-    """The 16 signed e2m1 values as a bf16 lookup row, once per device."""
+    """Return the 16 signed e2m1 values as a bf16 lookup row, once per device."""
     return torch.tensor(_CODE_VALUES, device=device, dtype=torch.bfloat16)
 
 
@@ -330,7 +330,7 @@ class Fp4TritonAttention(nn.Module):
                 torch.float32,
             )
         )
-        out = torch.empty_like(q)
+        out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         table = _code_table(q.device)
         block_s = max(16, 1 << (seq - 1).bit_length())
         _fp4_attention_forward[(batch * heads,)](
@@ -369,7 +369,7 @@ class Fp4TritonAttention(nn.Module):
             causal=is_causal,
             logit_scale=channels**-0.5 if scale is None else scale,
         )
-        return out
+        return out.to(q.dtype)
 
 
 class FP4PackedKVCache(FP4KVCache):

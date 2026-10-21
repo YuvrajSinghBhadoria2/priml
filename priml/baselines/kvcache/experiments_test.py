@@ -2,14 +2,17 @@
 
 ``exp000`` is pinned whole by a pprint golden: its prompts, context length,
 model, and dtype are the control every KV-cache fork is measured against.
-Config comparisons pin each fork's sole change: its cache allocator.
+Config comparisons pin each fork's cache allocator and, for exp003,
+the attention kernel that reads the packed cache.
 """
 
 from __future__ import annotations
 
-from priml.baselines.kvcache.experiments import exp000, exp001, exp002
+from priml.baselines.kvcache.experiments import exp000, exp001, exp002, exp003
 from priml.baselines.kvcache.fp4 import fp4_layer_cache
 from priml.baselines.kvcache.int8 import int8_layer_cache
+from priml.model.attention.attention import Attention
+from priml.model.transformer.block import TransformerBlock
 from priml.testing.golden import assert_pprint_golden
 
 
@@ -45,6 +48,33 @@ def test_exp002_changes_only_the_cache_allocator() -> None:
     control = exp000()
     assert forked.allocate_cache is fp4_layer_cache
     forked.allocate_cache = control.allocate_cache
+    assert forked.udiff(control) == ""
+
+
+def test_exp003_pprint() -> None:
+    assert_pprint_golden(test_file=__file__, name="exp003", config=exp003())
+
+
+def test_exp003_decodes_to_a_4096_token_context() -> None:
+    cfg = exp003()
+    assert cfg.prompt_len + cfg.num_decode_steps == 4096
+
+
+def test_exp003_changes_only_the_cache_and_the_kernel_reading_it() -> None:
+    forked = exp003()
+    control = exp000()
+    assert forked.allocate_cache is not control.allocate_cache
+    forked_block = forked.model.block
+    control_block = control.model.block
+    assert isinstance(forked_block, TransformerBlock.Config)
+    assert isinstance(control_block, TransformerBlock.Config)
+    forked_attn = forked_block.attn
+    control_attn = control_block.attn
+    assert isinstance(forked_attn, Attention.Config)
+    assert isinstance(control_attn, Attention.Config)
+    assert forked_attn.attn_kernel is not control_attn.attn_kernel
+    forked.allocate_cache = control.allocate_cache
+    forked_attn.attn_kernel = control_attn.attn_kernel
     assert forked.udiff(control) == ""
 
 

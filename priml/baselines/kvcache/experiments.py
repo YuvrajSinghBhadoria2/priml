@@ -44,6 +44,7 @@ from priml.baselines.kvcache.fp4 import fp4_layer_cache
 from priml.baselines.kvcache.fp4_fused import Fp4TritonAttention, fp4_fused_layer_cache
 from priml.baselines.kvcache.int8 import int8_layer_cache
 from priml.model.attention.attention import Attention
+from priml.model.transformer.block import TransformerBlock
 
 
 def exp000() -> DecodeBenchmark.Config:
@@ -247,7 +248,8 @@ def exp003() -> DecodeBenchmark.Config:
       exp001 and recovers only ~13% of the gap to exp000, so the
       dequantized copy was not the dominant per-step cost. Kernel output
       matches the materialized path to bf16 rounding (max abs diff 0.00195
-      against SDPA over _dequantized rows). The ladder's speed inversion
+      against SDPA over _dequantized rows under the ladder's masks). The
+      ladder's speed inversion
       is dominated by what quantization adds around the read: the
       per-step pack, the head-expansion copies, and launch overhead.
 
@@ -258,7 +260,9 @@ def exp003() -> DecodeBenchmark.Config:
     """
     cfg = exp000()
     cfg.allocate_cache = fp4_fused_layer_cache
-    attn = cfg.model.block.attn
+    block = cfg.model.block
+    assert isinstance(block, TransformerBlock.Config)
+    attn = block.attn
     assert isinstance(attn, Attention.Config)
     attn.attn_kernel = Fp4TritonAttention.Config(channels_head=64)
     return cfg
