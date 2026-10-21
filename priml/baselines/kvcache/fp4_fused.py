@@ -312,7 +312,7 @@ class Fp4TritonAttention(nn.Module):
             )
         if not length or not seq:
             raise ValueError(
-                f"Got an empty launch: batch={batch} seq={seq} length={length}."
+                f"Got an empty launch: batch={batch} seq={seq} length={length}.",
             )
         k = k.movedim(-3, -2).contiguous()
         v = v.movedim(-3, -2).contiguous()
