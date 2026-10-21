@@ -8,6 +8,7 @@ dtype. Every later experiment forks a named parent and changes ONE thing:
     exp000  bf16 weights, bf16 KV cache, 4096-token context
       +-- exp001  int8 codes, one float32 scale per token, packed in k/v
       +-- exp002  e2m1 (fp4) codes, one float32 scale per token, packed in k/v
+      +-- exp003  exp002's rows read by a fused Triton attention kernel
 
 Launch::
 
@@ -28,7 +29,8 @@ Score:
 
 A fork may change:
   ``allocate_cache``: the cache's dtype, layout, quantization, and the
-  arithmetic that reads it back.
+  arithmetic that reads it back -- including, for a fused read path, the
+  attention kernel that consumes the cache's served rows.
 
 A fork may not change:
   The model, its weights' dtype, the prompts, the context length, or the
@@ -39,7 +41,9 @@ from __future__ import annotations
 
 from priml.baselines.kvcache.decode import DecodeBenchmark
 from priml.baselines.kvcache.fp4 import fp4_layer_cache
+from priml.baselines.kvcache.fp4_fused import Fp4TritonAttention, fp4_fused_layer_cache
 from priml.baselines.kvcache.int8 import int8_layer_cache
+from priml.model.attention.attention import Attention
 
 
 def exp000() -> DecodeBenchmark.Config:
@@ -200,4 +204,61 @@ def exp002() -> DecodeBenchmark.Config:
     """
     cfg = exp000()
     cfg.allocate_cache = fp4_layer_cache
+    return cfg
+
+
+def exp003() -> DecodeBenchmark.Config:
+    """Serve exp002's packed fp4 rows straight to a fused attention kernel.
+
+    ``allocate_cache`` becomes :func:`fp4_fused_layer_cache`: the same packed
+    e2m1 rows and in-row float32 scales as exp002, but the cache serves the
+    packed slices themselves. ``attn_kernel`` becomes
+    :class:`Fp4TritonAttention`, whose Triton kernel unpacks each byte
+    through a 16-entry table in registers, scales by the row's float32 scale,
+    and attends -- the dequantized cache-sized copy exp001 and exp002
+    materialize every step is never written. The model, its dtype, the
+    prompts, the context length, the cache bytes, and the harness are
+    exp000's; only the read path differs from exp002.
+
+    Hypothesis:
+      exp002's −41% is the dequantized copy, not the codes: with the
+      materialization pass gone, decode reads packed rows (~0.56 B per
+      value including the scale's share) instead of a bf16 rewrite (2 B),
+      so exp003 beats exp000's tokens per second at exp002's cache bytes.
+      Frozen before measuring, on the same seed and session: SUCCESS is
+      exp003 >= exp000 (the ladder's speed sign flips); FAILURE is exp003
+      <= exp001 (fusion did not pay for its unpack); between the two is
+      reported as a partial result with no sign-flip claim.
+
+    References:
+      https://arxiv.org/abs/2402.02750
+        Liu et al. 2024. KIVI: A tuning-free asymmetric 2bit quantization
+        for KV cache. The motivation this rung tests end to end: packed
+        codes only win when attention reads them directly.
+      priml.baselines.nanochat.exp016
+        The house precedent for a Triton kernel entering a ladder as an
+        experiment rung rather than a core-model change.
+
+    Results:
+      2026-10-21, same A100 box, seed 20261021, two runs: exp003 690.6-692.1
+      tokens/sec, p99 13.9 ms, kv 37748736 bytes -- against that session's
+      exp000 1068.8-1070.9 and exp002 634.8-638.6. FAILURE by the frozen
+      rule: fusion beats exp002 by 8.6% and cuts p99, but lands below
+      exp001 and recovers only ~13% of the gap to exp000, so the
+      dequantized copy was not the dominant per-step cost. Kernel output
+      matches the materialized path to bf16 rounding (max abs diff 0.00195
+      against SDPA over _dequantized rows). The ladder's speed inversion
+      is dominated by what quantization adds around the read: the
+      per-step pack, the head-expansion copies, and launch overhead.
+
+    Returns:
+      config: exp000 with the packed-served fp4 cache and the fused Triton
+        attention kernel.
+
+    """
+    cfg = exp000()
+    cfg.allocate_cache = fp4_fused_layer_cache
+    attn = cfg.model.block.attn
+    assert isinstance(attn, Attention.Config)
+    attn.attn_kernel = Fp4TritonAttention.Config(channels_head=64)
     return cfg

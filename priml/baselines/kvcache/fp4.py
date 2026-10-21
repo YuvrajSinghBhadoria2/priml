@@ -252,16 +252,20 @@ class FP4KVCache(KVCache):
         self.v[..., self.length : end, :] = packed[1]
         self.length = end
         self.seen += s
+        return self._served(k, v)
+
+    def _served(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Return the valid slice this cache hands its attention."""
         return (
             _dequantized(
                 self.k,
-                end=end,
+                end=self.length,
                 channels=self.channels_head,
                 dtype=k.dtype,
             ),
             _dequantized(
                 self.v,
-                end=end,
+                end=self.length,
                 channels=self.channels_v_head,
                 dtype=v.dtype,
             ),
