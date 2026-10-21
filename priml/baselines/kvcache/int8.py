@@ -12,6 +12,12 @@ float cache's answer, so the model's read path is unchanged.
 
 The cache refuses :meth:`Int8KVCache.freeze`; a frozen view of the base
 class would hand int8 codes and scale bits straight to attention.
+
+The scale is rounded to float32 before encoding and clamped between its
+smallest positive subnormal (2**-149) and largest finite value. Finite
+float64 rows exceeding 127 times that maximum saturate; sufficiently small
+values round to zero. Subnormal scales have coarser relative precision.
+Decoded values saturate at the incoming dtype's finite limits.
 """
 
 from __future__ import annotations
@@ -22,7 +28,10 @@ from torch import Tensor
 
 import torch
 
+from priml.model.attention.attention import Attention
 from priml.model.attention.kvcache import KVCache, alloc_layer_cache
+from priml.model.attention.mla import MultiHeadLatentAttention
+from priml.model.custom_types import is_cached_attention
 
 
 if TYPE_CHECKING:
@@ -119,7 +128,8 @@ class Int8KVCache(KVCache):
         cache as it was.
 
         Args:
-          k: New keys ``[..., seq_len, channels_head]``, any float dtype.
+          k: New keys ``[..., seq_len, channels_head]``; float inputs use the
+            float32 scale range described in the module docstring.
           v: New values ``[..., seq_len, channels_v_head]``, likewise.
 
         Returns:
@@ -127,10 +137,16 @@ class Int8KVCache(KVCache):
           v: Dequantized values ``[..., length, channels_v_head]`` in ``v``'s dtype.
 
         Raises:
+          TypeError: Either input has a non-floating dtype.
           ValueError: ``k`` and ``v`` differ in length, or either cannot be
             written into the cache.
 
         """
+        if not k.is_floating_point() or not v.is_floating_point():
+            raise TypeError(
+                "KV cache keys and values must have floating-point dtypes; "
+                f"got {k.dtype} and {v.dtype}.",
+            )
         s = k.shape[-2]
         if v.shape[-2] != s:
             raise ValueError(
@@ -183,7 +199,12 @@ def int8_layer_cache(
 ) -> dict[DepthIndex, object]:
     """Allocate one :class:`Int8KVCache` per cached attention in ``model``.
 
-    Each slot mirrors :func:`alloc_layer_cache` -- same keys, same shapes --
+    Supports :class:`Attention` (including GQA) and
+    :class:`MultiHeadLatentAttention`. Other cached attention families are
+    rejected before allocation because they inspect raw storage geometry or
+    require tuple/recurrent state.
+
+    Each slot mirrors :func:`alloc_layer_cache` -- same keys, same logical shapes --
     widened by ``SCALE_COLUMNS`` so the scales live inside ``k`` and ``v``
     and the benchmark's byte count sees them.
 
@@ -198,8 +219,21 @@ def int8_layer_cache(
     Returns:
       cache: Mutable state keyed by each attention's full depth index.
 
+    Raises:
+      TypeError: The model contains an unsupported cached attention family.
+
     """
     del dtype
+    for module in model.modules():
+        if is_cached_attention(module) and not isinstance(
+            module,
+            (Attention, MultiHeadLatentAttention),
+        ):
+            raise TypeError(
+                f"Cached attention {type(module).__name__} is not supported by "
+                "int8_layer_cache; supported families are Attention (including "
+                "GQA) and MultiHeadLatentAttention.",
+            )
     result: dict[DepthIndex, object] = {}
     allocated = alloc_layer_cache(
         model,
@@ -229,11 +263,19 @@ def _quantize(x: Tensor) -> Tensor:
         if values.shape[-1]
         else values.new_zeros((*values.shape[:-1], 1))
     )
-    scale = peak.div(_CODE_MAX)
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    limits = torch.finfo(torch.float32)
+    scale = (
+        peak.div(_CODE_MAX)
+        .clamp(
+            min=limits.tiny * limits.eps,
+            max=limits.max,
+        )
+        .float()
+    )
+    scale = torch.where(peak == 0, torch.ones_like(scale), scale)
     codes = torch.round(values.div(scale)).clamp_(-_CODE_MAX, _CODE_MAX)
     codes = codes.to(torch.int8)
-    return torch.cat((codes, scale.float().view(torch.int8)), dim=-1)
+    return torch.cat((codes, scale.view(torch.int8)), dim=-1)
 
 
 def _dequantized(store: Tensor, *, end: int, dtype: torch.dtype) -> Tensor:
@@ -246,7 +288,10 @@ def _dequantized(store: Tensor, *, end: int, dtype: torch.dtype) -> Tensor:
         .clone(memory_format=torch.contiguous_format)
         .view(torch.float32)
     )
-    return (codes.to(_working_dtype(dtype)) * scale).to(dtype)
+    limit = torch.finfo(dtype).max
+    return (
+        (codes.to(_working_dtype(dtype)) * scale).clamp(min=-limit, max=limit).to(dtype)
+    )
 
 
 # Every dtype narrower than float32 promotes to it; float8 cannot be asked.

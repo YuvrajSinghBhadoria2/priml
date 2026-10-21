@@ -31,6 +31,7 @@ from priml.model.custom_types import (
     propagate_attr,
 )
 from priml.model.norm import RMSNorm
+from priml.model.passthrough import attribute_target
 from priml.model.swiglu import SwiGLU
 
 
@@ -95,10 +96,11 @@ class TransformerBlock(nn.Module):
                     propagate_attr(cfg, "channels_in", c, protocol=ChannelsIn)
                 if isinstance(cfg, ChannelsOut) and cfg.channels_out == -1:
                     propagate_attr(cfg, "channels_out", c, protocol=ChannelsOut)
+                target = attribute_target(cfg, "depth_index")
                 if (
                     self.depth_index
-                    and isinstance(cfg, HasDepthIndex)
-                    and not cfg.depth_index
+                    and isinstance(target, HasDepthIndex)
+                    and not target.depth_index
                 ):
                     propagate_attr(
                         cfg,

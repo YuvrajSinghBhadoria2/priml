@@ -13,6 +13,11 @@ Launch::
 
     uv --quiet run --frozen python -m priml priml.baselines.kvcache.experiments.exp000
 
+That command draws a fresh seed. For paired measurements at the reported
+seed, including generated-token agreement, follow the adjacent ``README.md``.
+The Results sections retain the author's original measurements. The scale-range
+fixes have not been benchmarked on that A100; raw timing artifacts are not included.
+
 Objective:
   Raise decode tokens per second, or shrink cache bytes at equal tokens per
   second, by changing how the cache stores keys and values.
@@ -119,10 +124,10 @@ def exp001() -> DecodeBenchmark.Config:
       re-reads the codes, rewrites the whole cache in the model's dtype,
       and attention reads that copy -- more traffic than bf16's single
       read, whatever the codes occupy. Token agreement with exp000 is
-      0.567 over the generated tail, first divergence at position 35:
-      this control's untrained weights sit near argmax ties, so greedy
-      agreement flips at the first noise-sized perturbation and cannot
-      carry a quality claim by itself.
+      0.567 over the generated tail, first divergence at position 35.
+      Near-tied logits from untrained weights could contribute, but logit
+      margins were not measured. These observations do not establish why
+      the streams diverged or support an equal-quality claim.
 
     Returns:
       config: exp000 with the int8 cache allocator.
@@ -179,13 +184,15 @@ def exp002() -> DecodeBenchmark.Config:
       each step rewrites the valid cache in the model's dtype and
       attention reads that copy instead of the codes, and no unpack
       micro-optimization pays back a pass the read path does not need.
-      The rung that would: attention over packed codes with the dequant in
-      registers, never writing the slice. Token agreement with exp000 is
+      Attention over packed codes with dequantization in registers is a
+      possible next experiment; its speedup has not been measured.
+      Token agreement with exp000 is
       0.158 over the generated tail, first divergence at position 4,
       unchanged across the unpack swap because the output is bitwise
-      equal: the control's untrained weights make greedy agreement a
-      noise-flip, so a trained checkpoint or a logit-level distance is
-      needed before any fork here can claim equal quality.
+      equal. Near-tied logits from untrained weights could contribute, but
+      logit margins were not measured. The cause of divergence and model
+      quality remain unmeasured; a trained checkpoint or logit-level
+      comparison is needed before claiming equal quality.
 
     Returns:
       config: exp000 with the fp4 cache allocator.

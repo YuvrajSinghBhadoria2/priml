@@ -24,6 +24,7 @@ from priml.model.custom_types import (
     HasOutputGrid,
     HasResetParameters,
     TensorModule,
+    propagate_attr,
 )
 
 
@@ -83,10 +84,15 @@ class Sequential(nn.Sequential):
             for index in range(self.repeat):
                 for element in base:
                     copied = element.copy_tree()
-                    if isinstance(copied, HasDepthIndex):
-                        copied.depth_index = self.depth_index
-                        if self.repeat > 1:
-                            copied.depth_index += ((index, self.repeat),)
+                    depth_index = self.depth_index
+                    if self.repeat > 1:
+                        depth_index += ((index, self.repeat),)
+                    propagate_attr(
+                        copied,
+                        "depth_index",
+                        depth_index,
+                        protocol=HasDepthIndex,
+                    )
                     expanded.append(copied)
             # Each element is finalized as it is reached, so the next reads a
             # DERIVED width: a norm infers ``channels_out`` from ``channels_in``

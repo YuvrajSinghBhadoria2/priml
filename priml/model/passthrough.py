@@ -84,16 +84,47 @@ class ReadWritePassthroughMixin(ReadPassthroughMixin):
 
     @override
     def __setattr__(self, name: str, value: object) -> None:
-        if name.startswith("_") or name == self._passthrough:
+        target = self.attribute_target(name)
+        if target is self:
             super().__setattr__(name, value)
             return
-        try:
-            target = self._passthrough_target(self._passthrough)
-        except AttributeError:
-            target = None
         if target is not None and hasattr(target, name):
             setattr(target, name, value)
             return
         raise AttributeError(
             f"{type(self).__name__!s} passthrough targets have no attribute {name!r}.",
         )
+
+    def attribute_target(self, name: str) -> object:
+        """Resolve this wrapper's write recipient, retaining its owned fields.
+
+        Args:
+          name: Attribute being assigned.
+
+        Returns:
+          target: The eventual recipient, or None when the backing object is absent.
+
+        """
+        if name.startswith("_") or name == self._passthrough:
+            return self
+        try:
+            target = self._passthrough_target(self._passthrough)
+        except AttributeError:
+            return None
+        return attribute_target(target, name)
+
+
+def attribute_target(config: object, name: str) -> object:
+    """Resolve the object receiving a normal or transparent attribute write.
+
+    Args:
+      config: Object receiving the assignment, possibly a transparent wrapper.
+      name: Attribute being assigned; private and backing fields stay local.
+
+    Returns:
+      target: The eventual write recipient, or None for an absent backing object.
+
+    """
+    if isinstance(config, ReadWritePassthroughMixin):
+        return config.attribute_target(name)
+    return config

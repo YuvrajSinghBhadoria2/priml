@@ -15,6 +15,7 @@ from priml.model.passthrough import (
     PassthroughAttribute,
     ReadPassthroughMixin,
     ReadWritePassthroughMixin,
+    attribute_target,
 )
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.golden import assert_text_golden
@@ -190,6 +191,25 @@ def test_read_write_passthrough_rejects_public_writes_before_target_exists() -> 
     wrapper.inner = _Target()
     wrapper.value = 5
     assert wrapper.inner.value == 5
+
+
+def test_attribute_target_keeps_private_and_read_only_attributes_local() -> None:
+    writable = _ReadWrite()
+    read_only = _ReadOnly()
+
+    assert attribute_target(writable, "_passthrough") is writable
+    assert attribute_target(read_only, "value") is read_only
+
+
+def test_attribute_target_resolves_nested_writes_and_preserves_backing_fields() -> None:
+    class NestedWrapper(ReadWritePassthroughMixin, passthrough="inner"):
+        def __init__(self) -> None:
+            self.inner = _ReadWrite()
+
+    outer = NestedWrapper()
+
+    assert attribute_target(outer, "value") is outer.inner.inner
+    assert attribute_target(outer, "inner") is outer
 
 
 if __name__ == "__main__":

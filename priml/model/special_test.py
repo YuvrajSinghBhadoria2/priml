@@ -22,6 +22,7 @@ from priml.model.attention.multi_stream import MultiStreamAttention
 from priml.model.attention.output_gate import OutputGate
 from priml.model.attention.value_gated_attention import ValueGatedAttention
 from priml.model.custom_types import (
+    ChannelsIn,
     ChannelsInOut,
     ChannelsOut,
     HasDepthIndex,
@@ -42,6 +43,7 @@ from priml.model.norm import (
     LayerNorm,
     RMSNorm,
 )
+from priml.model.sequential import Sequential
 from priml.model.special import (
     Activation,
     Dropout,
@@ -53,7 +55,8 @@ from priml.model.special import (
 )
 from priml.model.swiglu import relu, silu
 from priml.model.transformer.block import TransformerBlock
-from priml.model.transformer.mmdit import MMDiTBlock
+from priml.model.transformer.mmdit import MMDiTBlock, MMDiTStream
+from priml.model.transformer.transformer import Transformer
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.cost import assert_cost_matches_torch
 from priml.testing.golden import assert_pprint_golden
@@ -433,6 +436,108 @@ def test_skip_forwards_direct_attributes_and_propagation_to_inner() -> None:
     assert config.inner.depth_index == ((4, 5),)
     with pytest.raises(AttributeError, match="typo"):
         config.typo = 1
+
+
+def test_nested_skips_forward_protocol_gated_depth_to_the_leaf() -> None:
+    inner = Skip.Config()
+    inner.inner = Attention.Config()
+    config = Skip.Config()
+    config.inner = inner
+
+    propagate_attr(config, "depth_index", ((2, 3),), protocol=HasDepthIndex)
+
+    assert isinstance(config.inner, Skip.Config)
+    assert isinstance(config.inner.inner, Attention.Config)
+    assert config.inner.inner.depth_index == ((2, 3),)
+
+
+def test_propagation_replaces_the_wrappers_own_inner_field() -> None:
+    inner = Skip.Config()
+    inner.inner = Attention.Config()
+    config = Skip.Config()
+    config.inner = inner
+    replacement = Identity.Config()
+    replacement.channels_in = 16
+
+    propagate_attr(config, "inner", replacement, protocol=ChannelsIn)
+
+    assert config.inner is replacement
+
+
+@pytest.mark.parametrize("config_type", [TransformerBlock.Config, MMDiTStream.Config])
+def test_block_depth_reaches_a_wrapped_branch(
+    config_type: type[TransformerBlock.Config | MMDiTStream.Config],
+) -> None:
+    config = config_type()
+    config.channels_in = 16
+    config.depth_index = ((1, 3),)
+    branch = Skip.Config()
+    branch.inner = Linear.Config()
+    config.ffn = branch
+
+    config.finalize()
+
+    assert isinstance(config.ffn, Skip.Config)
+    assert isinstance(config.ffn.inner, Linear.Config)
+    assert config.ffn.inner.depth_index == config.depth_index
+
+
+@pytest.mark.parametrize("config_type", [TransformerBlock.Config, MMDiTStream.Config])
+def test_depth_indexed_blocks_preserve_wrapped_identity_branches(
+    config_type: type[TransformerBlock.Config | MMDiTStream.Config],
+) -> None:
+    config = config_type()
+    config.channels_in = 16
+    config.depth_index = ((1, 3),)
+    branch = Skip.Config()
+    branch.inner = Identity.Config()
+    config.norm1 = branch
+
+    config.finalize()
+
+    assert isinstance(config.norm1, Skip.Config)
+    assert isinstance(config.norm1.inner, Identity.Config)
+    assert config.norm1.inner.channels_in == config.norm1.inner.channels_out == 16
+    assert not hasattr(config.norm1, "depth_index")
+
+
+def test_repeated_sequential_assigns_nested_depth_through_skip() -> None:
+    inner = Linear.Config()
+    inner.channels_in = 4
+    inner.channels_out = 4
+    branch = Skip.Config()
+    branch.inner = inner
+    config = Sequential.Config()
+    config.elements = branch
+    config.repeat = 3
+    config.depth_index = ((1, 2),)
+
+    config.finalize()
+
+    assert isinstance(config.elements, list)
+    for index, element in enumerate(config.elements):
+        assert isinstance(element, Skip.Config)
+        assert isinstance(element.inner, Linear.Config)
+        assert element.inner.depth_index == ((1, 2), (index, 3))
+
+
+def test_transformer_assigns_layer_depth_through_a_wrapped_branch() -> None:
+    config = Transformer.Config()
+    config.channels_in = 16
+    config.num_layers = 3
+    assert isinstance(config.block, TransformerBlock.Config)
+    branch = Skip.Config()
+    branch.inner = Linear.Config()
+    config.block.ffn = branch
+
+    config.finalize()
+
+    assert isinstance(config.block, list)
+    for index, block in enumerate(config.block):
+        assert isinstance(block, TransformerBlock.Config)
+        assert isinstance(block.ffn, Skip.Config)
+        assert isinstance(block.ffn.inner, Linear.Config)
+        assert block.ffn.inner.depth_index == ((index, 3),)
 
 
 def test_skip_rejects_an_inner_width_change() -> None:

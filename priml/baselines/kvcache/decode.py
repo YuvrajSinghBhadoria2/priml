@@ -374,7 +374,7 @@ def token_agreement(control: Tensor, candidate: Tensor) -> float:
       fraction: Same-token positions, over every batch row and position.
 
     Raises:
-      ValueError: The two streams differ in shape.
+      ValueError: The two streams differ in shape or contain no positions.
 
     """
     if control.shape != candidate.shape:
@@ -382,6 +382,8 @@ def token_agreement(control: Tensor, candidate: Tensor) -> float:
             f"Got {tuple(control.shape)} control and {tuple(candidate.shape)} "
             "candidate tokens; agreement pairs positions one to one.",
         )
+    if control.numel() == 0:
+        raise ValueError("Token agreement requires non-empty streams.")
     return (control == candidate).float().mean().item()
 
 

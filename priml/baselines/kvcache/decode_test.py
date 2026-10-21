@@ -247,6 +247,14 @@ def test_token_agreement_rejects_misaligned_streams() -> None:
         token_agreement(torch.zeros(2, 3), torch.zeros(2, 4))
 
 
+@pytest.mark.parametrize("shape", [(2, 0), (0, 3)])
+def test_token_agreement_rejects_empty_streams(shape: tuple[int, int]) -> None:
+    tokens = torch.empty(shape, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        token_agreement(tokens, tokens)
+
+
 def test_greedy_decode_bfb() -> None:
     cfg = _tiny()
     # One layer: replay cost is per op under host_agnostic_numerics, and a

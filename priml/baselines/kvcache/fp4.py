@@ -16,6 +16,14 @@ read path is unchanged.
 
 The cache refuses :meth:`FP4KVCache.freeze`; a frozen view of the base class
 would hand packed codes and scale bits straight to attention.
+
+The scale is rounded to float32 before encoding and clamped between its
+smallest positive subnormal (2**-149) and largest finite value. Finite
+float64 rows exceeding six times that maximum saturate; sufficiently small
+values round to zero. Subnormal scales have coarser relative precision.
+Decoded values saturate at the incoming dtype's finite limits. This is
+the e2m1 value grid with float32 per-row scales, not the complete MX format;
+midpoint ties select the lower magnitude and signed zero is preserved.
 """
 
 from __future__ import annotations
@@ -27,7 +35,10 @@ from torch import Tensor
 
 import torch
 
+from priml.model.attention.attention import Attention
 from priml.model.attention.kvcache import KVCache, alloc_layer_cache
+from priml.model.attention.mla import MultiHeadLatentAttention
+from priml.model.custom_types import is_cached_attention
 
 
 if TYPE_CHECKING:
@@ -53,7 +64,7 @@ _CODE_VALUES: Final = (
     3.0,
     4.0,
     6.0,
-    0.0,
+    -0.0,
     -0.5,
     -1.0,
     -1.5,
@@ -183,7 +194,8 @@ class FP4KVCache(KVCache):
         cache as it was.
 
         Args:
-          k: New keys ``[..., seq_len, channels_head]``, any float dtype.
+          k: New keys ``[..., seq_len, channels_head]``; float inputs use the
+            float32 scale range described in the module docstring.
           v: New values ``[..., seq_len, channels_v_head]``, likewise.
 
         Returns:
@@ -191,10 +203,16 @@ class FP4KVCache(KVCache):
           v: Dequantized values ``[..., length, channels_v_head]`` in ``v``'s dtype.
 
         Raises:
+          TypeError: Either input has a non-floating dtype.
           ValueError: ``k`` and ``v`` differ in length, or either cannot be
             written into the cache.
 
         """
+        if not k.is_floating_point() or not v.is_floating_point():
+            raise TypeError(
+                "KV cache keys and values must have floating-point dtypes; "
+                f"got {k.dtype} and {v.dtype}.",
+            )
         s = k.shape[-2]
         if v.shape[-2] != s:
             raise ValueError(
@@ -260,7 +278,12 @@ def fp4_layer_cache(
 ) -> dict[DepthIndex, object]:
     """Allocate one :class:`FP4KVCache` per cached attention in ``model``.
 
-    Each slot mirrors :func:`alloc_layer_cache` -- same keys, same shapes --
+    Supports :class:`Attention` (including GQA) and
+    :class:`MultiHeadLatentAttention`. Other cached attention families are
+    rejected before allocation because they inspect raw storage geometry or
+    require tuple/recurrent state.
+
+    Each slot mirrors :func:`alloc_layer_cache` -- same keys, same logical shapes --
     narrowed to packed rows widened by ``SCALE_COLUMNS`` so the scales live
     inside ``k`` and ``v`` and the benchmark's byte count sees them.
 
@@ -275,8 +298,21 @@ def fp4_layer_cache(
     Returns:
       cache: Mutable state keyed by each attention's full depth index.
 
+    Raises:
+      TypeError: The model contains an unsupported cached attention family.
+
     """
     del dtype
+    for module in model.modules():
+        if is_cached_attention(module) and not isinstance(
+            module,
+            (Attention, MultiHeadLatentAttention),
+        ):
+            raise TypeError(
+                f"Cached attention {type(module).__name__} is not supported by "
+                "fp4_layer_cache; supported families are Attention (including "
+                "GQA) and MultiHeadLatentAttention.",
+            )
     result: dict[DepthIndex, object] = {}
     allocated = alloc_layer_cache(
         model,
@@ -311,19 +347,27 @@ def _quantize(x: Tensor) -> Tensor:
         if values.shape[-1]
         else values.new_zeros((*values.shape[:-1], 1))
     )
-    scale = peak.div(_MAGNITUDE_MAX)
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    limits = torch.finfo(torch.float32)
+    scale = (
+        peak.div(_MAGNITUDE_MAX)
+        .clamp(
+            min=limits.tiny * limits.eps,
+            max=limits.max,
+        )
+        .float()
+    )
+    scale = torch.where(peak == 0, torch.ones_like(scale), scale)
     midpoints = _midpoints(scale.device, values.dtype)
     # The expand that broadcast the update leaves stride-0 axes; bucketize
     # asks for a contiguous view, and contiguous() is a no-op otherwise.
     ratios = values.abs().div(scale).contiguous()
     index = torch.bucketize(ratios, midpoints)
-    codes = index.to(torch.uint8) | (values.lt(0).to(torch.uint8) << 3)
+    codes = index.to(torch.uint8) | (values.signbit().to(torch.uint8) << 3)
     if codes.shape[-1] % 2:
         # An odd row parks its last code in the high nibble; read trims.
         codes = torch.cat((codes, codes.new_zeros((*codes.shape[:-1], 1))), dim=-1)
     packed = (codes[..., 0::2] << 4) | codes[..., 1::2]
-    return torch.cat((packed, scale.float().view(torch.uint8)), dim=-1)
+    return torch.cat((packed, scale.view(torch.uint8)), dim=-1)
 
 
 def _dequantized(
@@ -344,7 +388,8 @@ def _dequantized(
     )
     pairs = _pair_table(store.device, _working_dtype(dtype))
     values = pairs[packed.long()].flatten(-2)[..., :channels]
-    return (values * scale).to(dtype)
+    limit = torch.finfo(dtype).max
+    return (values * scale).clamp(min=-limit, max=limit).to(dtype)
 
 
 @lru_cache(maxsize=8)

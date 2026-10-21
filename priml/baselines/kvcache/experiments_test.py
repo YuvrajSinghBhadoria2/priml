@@ -2,8 +2,7 @@
 
 ``exp000`` is pinned whole by a pprint golden: its prompts, context length,
 model, and dtype are the control every KV-cache fork is measured against.
-``exp001`` and ``exp002`` are pinned the same way. A config comparison checks
-that only their cache allocator differs from ``exp000``.
+Config comparisons pin each fork's sole change: its cache allocator.
 """
 
 from __future__ import annotations
@@ -23,10 +22,6 @@ def test_exp000_decodes_to_a_4096_token_context() -> None:
     assert cfg.prompt_len + cfg.num_decode_steps == 4096
 
 
-def test_exp001_pprint() -> None:
-    assert_pprint_golden(test_file=__file__, name="exp001", config=exp001())
-
-
 def test_exp001_decodes_to_a_4096_token_context() -> None:
     cfg = exp001()
     assert cfg.prompt_len + cfg.num_decode_steps == 4096
@@ -38,10 +33,6 @@ def test_exp001_changes_only_the_cache_allocator() -> None:
     assert forked.allocate_cache is int8_layer_cache
     forked.allocate_cache = control.allocate_cache
     assert forked.udiff(control) == ""
-
-
-def test_exp002_pprint() -> None:
-    assert_pprint_golden(test_file=__file__, name="exp002", config=exp002())
 
 
 def test_exp002_decodes_to_a_4096_token_context() -> None:

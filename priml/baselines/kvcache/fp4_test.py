@@ -22,13 +22,20 @@ from priml.baselines.kvcache.decode_test import (
     _tiny,
 )
 from priml.baselines.kvcache.fp4 import (
+    _MAGNITUDE_MAX,
     SCALE_COLUMNS,
     FP4KVCache,
     _packed,
+    _pair_table,
     fp4_layer_cache,
 )
+from priml.model.attention.attention import Attention
+from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kvcache import KVCache, alloc_layer_cache
 from priml.model.attention.mla import MultiHeadLatentAttention
+from priml.model.attention.multi_stream import MultiStreamAttention
+from priml.model.attention.qwen3_5_delta import Qwen35GatedDeltaNet
+from priml.model.transformer.block import TransformerBlock
 
 
 if TYPE_CHECKING:
@@ -39,28 +46,20 @@ if TYPE_CHECKING:
 
 _NUM_HEADS: Final = 3
 _CHANNELS_HEAD_CACHE: Final = 4
-_MAGNITUDE_MAX: Final = 6.0
-
-
-def _small_decoder() -> Transformer.Config:
-    """Return ``decoder()`` at two layers; its 64-wide cache rows stay."""
-    cfg = decoder()
-    cfg.channels_in, cfg.num_layers = 128, 2
-    return cfg
 
 
 def test_fp4_cache_counts_its_scales_inside_the_cache_tensors() -> None:
     model = _small_decoder().make()
-    max_seq = 64
+    max_seq = 5
     default = alloc_layer_cache(
         model,
-        batch=2,
+        batch=4,
         max_seq=max_seq,
         dtype=torch.float32,
     )
     packed = fp4_layer_cache(
         model,
-        batch=2,
+        batch=4,
         max_seq=max_seq,
         dtype=torch.float32,
     )
@@ -113,19 +112,113 @@ def test_update_answers_in_the_incoming_dtype() -> None:
 
 def test_the_e2m1_grid_roundtrips_exactly() -> None:
     magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    row = torch.cat((magnitudes, -magnitudes)).reshape(1, 1, 1, 16)
-    cache = FP4KVCache(
-        k=torch.zeros(1, 1, 2, 8 + SCALE_COLUMNS, dtype=torch.uint8),
-        v=torch.zeros(1, 1, 2, 8 + SCALE_COLUMNS, dtype=torch.uint8),
-        length=0,
+    row = torch.cat((magnitudes, -magnitudes)) * torch.arange(1, 2 * 3 * 5 + 1).reshape(
+        2,
+        3,
+        5,
+        1,
+    )
+    cache = FP4KVCache.alloc(
+        batch=2,
+        num_heads=3,
+        max_seq=7,
         channels_head=16,
-        channels_v_head=16,
     )
 
     k_all, _ = cache.update(row, row)
 
-    # The row's peak is 6, so its scale is one and every value is on-grid.
     torch.testing.assert_close(k_all, row, rtol=0, atol=0)
+    assert torch.equal(torch.signbit(k_all), torch.signbit(row))
+
+
+@pytest.mark.parametrize(
+    ("row", "packed"),
+    [([6.0, 0.5, 1.0, 1.5], [0x71, 0x23]), ([6.0, 0.5, 1.0], [0x71, 0x20])],
+)
+def test_packed_bytes_follow_the_e2m1_nibble_layout(
+    row: list[float],
+    packed: list[int],
+) -> None:
+    cache = FP4KVCache.alloc(batch=2, num_heads=3, max_seq=5, channels_head=len(row))
+    incoming = torch.tensor(row).expand(2, 3, 4, len(row))
+
+    cache.update(incoming, incoming)
+
+    expected = torch.tensor(packed, dtype=torch.uint8).expand(2, 3, 4, len(packed))
+    assert torch.equal(cache.k[..., :4, :-SCALE_COLUMNS], expected)
+    assert torch.equal(cache.v[..., :4, :-SCALE_COLUMNS], expected)
+
+
+def test_every_packed_byte_decodes_against_a_literal_format_oracle() -> None:
+    values = (
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    )
+    expected = torch.tensor([(high, low) for high in values for low in values])
+
+    actual = _pair_table(torch.device("cpu"), torch.float32)
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.signbit(actual), torch.signbit(expected))
+
+
+def test_midpoint_ties_choose_the_lower_magnitude() -> None:
+    row = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0])
+    incoming = torch.stack((row, -row, row * 2, -row * 2, row * 3)).expand(
+        2,
+        3,
+        5,
+        8,
+    )
+    cache = FP4KVCache.alloc(batch=2, num_heads=3, max_seq=5, channels_head=8)
+
+    actual, _ = cache.update(incoming, incoming)
+
+    rounded = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    expected = torch.stack(
+        (rounded, -rounded, rounded * 2, -rounded * 2, rounded * 3),
+    ).expand_as(actual)
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.signbit(actual), torch.signbit(expected))
+
+
+def test_signed_zero_survives_encoding_and_decoding() -> None:
+    incoming = torch.tensor([0.0, -0.0, 6.0, -6.0]).expand(2, 3, 5, 4)
+    cache = _cache()
+
+    keys, values = cache.update(incoming, incoming)
+
+    expected = torch.tensor([0x08, 0x7F], dtype=torch.uint8).expand(2, 3, 5, 2)
+    assert torch.equal(cache.k[..., :-SCALE_COLUMNS], expected)
+    for actual in (keys, values):
+        assert torch.equal(actual, incoming)
+        assert torch.equal(torch.signbit(actual), torch.signbit(incoming))
+
+
+def test_float64_encoding_uses_the_rounded_stored_scale() -> None:
+    row = torch.tensor([6.0, 0.25, -0.25, 1.0], dtype=torch.float64) * (1 + 2**-25)
+    incoming = row.expand(2, 3, 5, 4)
+
+    actual, _ = _cache().update(incoming, incoming)
+
+    expected = torch.tensor([6.0, 0.5, -0.5, 1.0], dtype=torch.float64).expand_as(
+        actual,
+    )
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("channels", [1, 2, 3, 4, 5, 6, 7, 8])
@@ -166,7 +259,12 @@ def test_scale_unpacking_handles_every_row_alignment(
 
 @pytest.mark.parametrize(
     ("dtype", "value"),
-    [(torch.float16, 1e-6), (torch.bfloat16, 2e-38), (torch.float64, 1e39)],
+    [
+        (torch.float16, 1e-6),
+        (torch.bfloat16, 2e-38),
+        (torch.float32, 1e-45),
+        (torch.float64, 1e39),
+    ],
 )
 def test_dequantization_preserves_the_inputs_dynamic_range(
     dtype: torch.dtype,
@@ -183,6 +281,82 @@ def test_dequantization_preserves_the_inputs_dynamic_range(
 
     torch.testing.assert_close(k_all, incoming, rtol=1 / 127, atol=0)
     torch.testing.assert_close(v_all, incoming, rtol=1 / 127, atol=0)
+
+
+@pytest.mark.parametrize("value", [1e42, 1e-100])
+def test_float64_values_outside_scale_range_saturate_or_underflow(value: float) -> None:
+    incoming = torch.full((2, 3, 5, 4), value, dtype=torch.float64)
+    cache = _cache()
+
+    keys, values = cache.update(incoming, incoming)
+
+    scales = (
+        cache.k[..., -SCALE_COLUMNS:]
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.float32)
+    )
+    limits = torch.finfo(torch.float32)
+    assert torch.all(
+        scales == (limits.max if value > limits.max else limits.tiny * limits.eps),
+    )
+    expected = min(value, _MAGNITUDE_MAX * torch.finfo(torch.float32).max)
+    if value < torch.finfo(torch.float32).tiny * torch.finfo(torch.float32).eps / 4:
+        expected = 0.0
+    for actual in (keys, values):
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual, torch.full_like(actual, expected))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_finite_dtype_maxima_do_not_reconstruct_as_infinity(dtype: torch.dtype) -> None:
+    row = torch.tensor([1.0, -1.0, 1.0, -1.0], dtype=dtype)
+    incoming = (row * torch.finfo(dtype).max).expand(2, 3, 5, 4)
+
+    keys, values = _cache().update(incoming, incoming)
+
+    for actual in (keys, values):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, incoming, rtol=1 / 127, atol=0)
+
+
+@pytest.mark.parametrize("channels_head", [4, 64])
+def test_layer_allocator_rejects_gated_attention_before_decode(
+    channels_head: int,
+) -> None:
+    cfg = GatedAttention.Config()
+    cfg.channels_in = 8
+    cfg.num_heads = 6
+    cfg.num_heads_kv = 3
+    cfg.channels_head = channels_head
+    cfg.depth_index = ((0, 1),)
+
+    with pytest.raises(TypeError, match=r"GatedAttention.*supported"):
+        fp4_layer_cache(cfg.make(), batch=2, max_seq=5)
+
+
+def test_layer_allocator_rejects_multistream_attention_before_decode() -> None:
+    cfg = MultiStreamAttention.Config()
+    cfg.channels_in = 8
+    cfg.num_heads = 6
+    cfg.num_heads_kv = 3
+    cfg.channels_head = 4
+    cfg.depth_index = ((0, 1),)
+
+    with pytest.raises(TypeError, match=r"MultiStreamAttention.*supported"):
+        fp4_layer_cache(cfg.make(), batch=2, max_seq=5)
+
+
+def test_layer_allocator_rejects_recurrent_delta_state_before_decode() -> None:
+    cfg = Qwen35GatedDeltaNet.Config()
+    cfg.channels_in = 8
+    cfg.num_heads_k = 2
+    cfg.num_heads_v = 4
+    cfg.channels_k_head = 3
+    cfg.channels_v_head = 5
+    cfg.depth_index = ((0, 1),)
+
+    with pytest.raises(TypeError, match=r"Qwen35GatedDeltaNet.*supported"):
+        fp4_layer_cache(cfg.make(), batch=2, max_seq=5)
 
 
 def test_channel_broadcasting_matches_the_float_cache_after_eviction() -> None:
@@ -497,6 +671,25 @@ def test_rejected_updates_preserve_storage_and_progress(failure: str) -> None:
     assert (cache.length, cache.seen) == (initial.shape[-2], initial.shape[-2])
 
 
+@pytest.mark.parametrize("dtype", [torch.int64, torch.bool])
+def test_rejecting_nonfloat_values_preserves_storage_and_progress(
+    dtype: torch.dtype,
+) -> None:
+    cache = _cache(max_seq=6)
+    initial = torch.ones(2, _NUM_HEADS, 6, _CHANNELS_HEAD_CACHE)
+    cache.update(initial, initial)
+    keys_before, values_before = cache.k.clone(), cache.v.clone()
+    keys = torch.full((2, _NUM_HEADS, 5, _CHANNELS_HEAD_CACHE), 2.0)
+    values = torch.ones_like(keys, dtype=dtype)
+
+    with pytest.raises(TypeError, match="floating"):
+        cache.update(keys, values)
+
+    assert torch.equal(cache.k, keys_before)
+    assert torch.equal(cache.v, values_before)
+    assert (cache.length, cache.seen) == (initial.shape[-2], initial.shape[-2])
+
+
 def test_update_refuses_a_width_the_cache_cannot_hold() -> None:
     cache = _cache()
     too_wide = torch.zeros(
@@ -538,6 +731,18 @@ def test_the_prompt_the_end_to_end_run_feeds_is_still_exp000s() -> None:
     report = cfg.make().measure()
 
     assert torch.equal(report.tokens[:, :PROMPT_LEN], _prompt())
+
+
+def _small_decoder() -> Transformer.Config:
+    """Keep 64-wide rows for the byte ratio with distinct batch/head/sequence axes."""
+    cfg = decoder()
+    cfg.channels_in, cfg.num_layers = 128, 2
+    block = cfg.block
+    assert isinstance(block, TransformerBlock.Config)
+    attn = block.attn
+    assert isinstance(attn, Attention.Config)
+    attn.num_heads, attn.num_heads_kv = 6, 3
+    return cfg
 
 
 def _cache(*, batch: int = 2, max_seq: int = 5) -> FP4KVCache:
