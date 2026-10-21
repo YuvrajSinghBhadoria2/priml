@@ -163,18 +163,29 @@ def exp002() -> DecodeBenchmark.Config:
 
     Results:
       2026-10-21, 1x A100-SXM4-80GB (MIG 2g.20gb), torch 2.11.0+cu128,
-      seed 20261021: 545.6-546.6 decode tokens/sec, 49% below exp000's
-      1082.1-1083.8 under the same seed; p99 step 19.1 ms; kv cache
-      37748736 bytes at full context, 1152 per token against exp000's
-      4096 and exp001's 2176. The byte half of the ladder holds; the
-      speed half fails as exp001's did -- the dequantized slice is
-      materialized every step -- and the nibble unpack adds gathers on
-      top of that pass, so fp4 costs more per step than int8 despite
-      storing fewer bytes. Token agreement with exp000 is 0.158 over the
-      generated tail, first divergence at position 4: the control's
-      untrained weights make greedy agreement a noise-flip, so a trained
-      checkpoint or a logit-level distance is needed before any fork
-      here can claim equal quality.
+      seed 20261021. The nibble unpack as first written -- a shift and a
+      mask, two int64 casts, two gathers, a stack -- ran 545.6-546.6 decode
+      tokens/sec, 49% below exp000's 1082.1-1083.8 under the same seed,
+      p99 step 19.1 ms. Replacing it with a 256-entry table that maps a
+      whole packed byte to its (high, low) e2m1 pair in one int64 gather
+      lifts the run to 643.8-649.2 tokens/sec against that session's
+      exp000 1099.6 and exp001 746.3-746.6, p99 step 14.7-15.2 ms: 41%
+      below exp000 instead of 49%, with dequantized output bitwise equal
+      (torch.equal holds against the shifts on a quantized store), so the
+      generated tokens do not move. kv cache stays 37748736 bytes at full
+      context, 1152 per token against exp000's 4096 and exp001's 2176.
+      The byte half of the ladder holds; the speed half still fails as
+      exp001's did -- the dequantized slice is materialized every step, so
+      each step rewrites the valid cache in the model's dtype and
+      attention reads that copy instead of the codes, and no unpack
+      micro-optimization pays back a pass the read path does not need.
+      The rung that would: attention over packed codes with the dequant in
+      registers, never writing the slice. Token agreement with exp000 is
+      0.158 over the generated tail, first divergence at position 4,
+      unchanged across the unpack swap because the output is bitwise
+      equal: the control's untrained weights make greedy agreement a
+      noise-flip, so a trained checkpoint or a logit-level distance is
+      needed before any fork here can claim equal quality.
 
     Returns:
       config: exp000 with the fp4 cache allocator.

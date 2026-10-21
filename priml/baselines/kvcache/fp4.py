@@ -9,7 +9,7 @@ scales together.
 
 Torch's native ``float4_e2m1fn_x2`` tensor still cannot be filled or
 converted on every device this harness runs, so the codes stay in uint8 and
-the arithmetic unpacks the nibbles on read. Attention never sees the codes:
+a 256-entry lookup table unpacks a byte's two nibbles on read in one gather. Attention never sees the codes:
 :meth:`FP4KVCache.update` returns the dequantized valid slice in the
 incoming dtype, shaped exactly like the float cache's answer, so the model's
 read path is unchanged.
@@ -313,7 +313,7 @@ def _quantize(x: Tensor) -> Tensor:
     )
     scale = peak.div(_MAGNITUDE_MAX)
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    midpoints, _ = _tables(scale.device, values.dtype)
+    midpoints = _midpoints(scale.device, values.dtype)
     # The expand that broadcast the update leaves stride-0 axes; bucketize
     # asks for a contiguous view, and contiguous() is a no-op otherwise.
     ratios = values.abs().div(scale).contiguous()
@@ -342,20 +342,25 @@ def _dequantized(
         .clone(memory_format=torch.contiguous_format)
         .view(torch.float32)
     )
-    _, magnitudes = _tables(store.device, _working_dtype(dtype))
-    high = magnitudes[(packed >> 4).long()]
-    low = magnitudes[(packed & 0x0F).long()]
-    values = torch.stack((high, low), dim=-1).flatten(-2)[..., :channels]
+    pairs = _pair_table(store.device, _working_dtype(dtype))
+    values = pairs[packed.long()].flatten(-2)[..., :channels]
     return (values * scale).to(dtype)
 
 
 @lru_cache(maxsize=8)
-def _tables(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-    """Build the snap midpoints and signed code values, once per device."""
-    return (
-        torch.tensor(_MIDPOINTS, device=device, dtype=dtype),
-        torch.tensor(_CODE_VALUES, device=device, dtype=dtype),
-    )
+def _pair_table(device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Map every packed byte to its (high, low) signed e2m1 values."""
+    codes = torch.tensor(_CODE_VALUES, device=device, dtype=dtype)
+    byte = torch.arange(256, device=device, dtype=torch.uint8)
+    high = codes[(byte >> 4).long()]
+    low = codes[(byte & 0x0F).long()]
+    return torch.stack((high, low), dim=-1)
+
+
+@lru_cache(maxsize=8)
+def _midpoints(device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Build the snap midpoints, once per device."""
+    return torch.tensor(_MIDPOINTS, device=device, dtype=dtype)
 
 
 # Every dtype narrower than float32 promotes to it; float8 cannot be asked.
