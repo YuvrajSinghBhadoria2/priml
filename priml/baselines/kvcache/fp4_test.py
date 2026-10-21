@@ -25,8 +25,10 @@ from priml.baselines.kvcache.fp4 import (
     _MAGNITUDE_MAX,
     SCALE_COLUMNS,
     FP4KVCache,
+    _dequantized,
     _packed,
     _pair_table,
+    _quantize,
     fp4_layer_cache,
 )
 from priml.model.attention.attention import Attention
@@ -317,6 +319,41 @@ def test_finite_dtype_maxima_do_not_reconstruct_as_infinity(dtype: torch.dtype) 
     for actual in (keys, values):
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, incoming, rtol=1 / 127, atol=0)
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [(torch.float16, 70_000.0), (torch.bfloat16, 3.4e38), (torch.float32, 3.5e38)],
+)
+def test_dequantization_clamps_reconstructions_beyond_the_target_dtype(
+    sign: int,
+    dtype: torch.dtype,
+    value: float,
+) -> None:
+    incoming = torch.full((2, 3, 5, 4), sign * value, dtype=torch.float64)
+    store = _quantize(incoming)
+
+    actual = _dequantized(store, end=5, channels=4, dtype=dtype)
+
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, torch.full_like(actual, sign * torch.finfo(dtype).max))
+
+
+def test_dequantization_keeps_the_stores_meta_device() -> None:
+    store = torch.zeros(
+        2,
+        3,
+        5,
+        _packed(4) + SCALE_COLUMNS,
+        dtype=torch.uint8,
+        device="meta",
+    )
+
+    actual = _dequantized(store, end=5, channels=4, dtype=torch.float32)
+
+    assert actual.device == store.device
+    assert actual.shape == (2, 3, 5, 4)
 
 
 @pytest.mark.parametrize("channels_head", [4, 64])

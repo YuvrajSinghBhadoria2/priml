@@ -29,7 +29,6 @@ from priml.baselines.kvcache.fp4_fused import (
     _fp4_attention_forward_triton,
     fp4_fused_layer_cache,
 )
-from priml.kernel import jit_kernel
 from priml.model.attention.attention import Attention
 from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import attention_kernel_cost
@@ -43,8 +42,6 @@ from priml.model.transformer.block import TransformerBlock
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from triton import language
-
     from priml.testing.triton_interpreter import triton_interpreter
 else:
     from wrapt import lazy_import
@@ -53,7 +50,6 @@ else:
         "priml.testing.triton_interpreter",
         "triton_interpreter",
     )
-    language = lazy_import("triton.language")
 
 
 _NUM_HEADS: Final = 3
@@ -273,23 +269,6 @@ def test_uniform_attention_matches_known_values_across_tile_boundaries(
 
 
 @pytest.mark.gpu_triton
-@pytest.mark.parametrize("channels", [16, 32, 64])
-def test_bf16_dot_preserves_a_one_hot_query(channels: int) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("needs a CUDA device")
-    # _fp4_attention_forward_triton uses at least 16 query rows per dot tile.
-    q = torch.zeros(16, channels, dtype=torch.bfloat16, device="cuda")
-    q[:, 0] = 1
-    k = torch.zeros(channels, 32, dtype=torch.bfloat16, device="cuda")
-    k[0] = 6
-    out = torch.empty(16, 32, dtype=torch.float32, device="cuda")
-
-    jit_kernel(_bf16_dot_probe_triton)[(1,)](q, k, out, channels=channels)
-
-    assert torch.equal(out, torch.full_like(out, 6)), out
-
-
-@pytest.mark.gpu_triton
 @pytest.mark.parametrize("length", [7, 131])
 @pytest.mark.parametrize("high_tail", [False, True])
 @pytest.mark.parametrize("channels", [16, 32, 64])
@@ -319,6 +298,7 @@ def test_known_nonuniform_logits_weight_the_final_rows(
 
 @pytest.mark.gpu_triton
 @pytest.mark.parametrize("block_l", [16, 128])
+@pytest.mark.parametrize("channels", [16, 64])
 @pytest.mark.parametrize(
     ("seq", "causal"),
     [(1, False), (1, True), (4, True)],
@@ -328,9 +308,10 @@ def test_kernel_matches_sdpa_over_dequantized_rows(
     seq: int,
     causal: bool,
     block_l: int,
+    channels: int,
 ) -> None:
     # greedy_decode feeds logits[:, -1:] after prefill, so decode has one query.
-    q, k, v = _cuda_case(seq=seq)
+    q, k, v = _cuda_case(seq=seq, channels=channels)
     config = Fp4TritonAttention.Config()
     config.block_l = block_l
     attention = config.make()
@@ -461,21 +442,6 @@ def _cuda_case(
         ),
     )
     return q, k, v
-
-
-def _bf16_dot_probe_triton(
-    q_ptr: language.tensor,
-    k_ptr: language.tensor,
-    out_ptr: language.tensor,
-    channels: language.constexpr,
-) -> None:
-    rows = language.arange(0, 16)
-    cols = language.arange(0, 32)
-    width = language.arange(0, channels)
-    q = language.load(q_ptr + rows[:, None] * channels + width[None, :])
-    k = language.load(k_ptr + width[:, None] * 32 + cols[None, :])
-    out = language.dot(q, k)
-    language.store(out_ptr + rows[:, None] * 32 + cols[None, :], out)
 
 
 def _reference(

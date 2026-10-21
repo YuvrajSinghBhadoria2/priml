@@ -387,6 +387,8 @@ def _fp4_attention_forward_triton(  # noqa: PLR0917 -- The signature is the kern
             mask=valid[:, None],
             other=0,
         )
+        # Joining half-width rows gave incorrect 16-wide bf16 attention on RTX5090.
+        # Channel indices avoid that layout transition before the dot product.
         index = language.where(
             (d[None, :] & 1) == 0,
             codes.to(language.int32) >> 4,
