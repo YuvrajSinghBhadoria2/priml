@@ -29,6 +29,7 @@ from priml.baselines.kvcache.fp4_fused import (
     _fp4_attention_forward_triton,
     fp4_fused_layer_cache,
 )
+from priml.kernel import jit_kernel
 from priml.model.attention.attention import Attention
 from priml.model.attention.gated_attention import GatedAttention
 from priml.model.attention.kernel import attention_kernel_cost
@@ -42,6 +43,8 @@ from priml.model.transformer.block import TransformerBlock
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from triton import language
+
     from priml.testing.triton_interpreter import triton_interpreter
 else:
     from wrapt import lazy_import
@@ -50,6 +53,7 @@ else:
         "priml.testing.triton_interpreter",
         "triton_interpreter",
     )
+    language = lazy_import("triton.language")
 
 
 _NUM_HEADS: Final = 3
@@ -270,24 +274,43 @@ def test_uniform_attention_matches_known_values_across_tile_boundaries(
 
 
 @pytest.mark.gpu_triton
+@pytest.mark.parametrize("channels", [16, 32, 64])
+def test_bf16_dot_preserves_a_one_hot_query(channels: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    # _fp4_attention_forward_triton uses at least 16 query rows per dot tile.
+    q = torch.zeros(16, channels, dtype=torch.bfloat16, device="cuda")
+    q[:, 0] = 1
+    k = torch.zeros(channels, 32, dtype=torch.bfloat16, device="cuda")
+    k[0] = 6
+    out = torch.empty(16, 32, dtype=torch.float32, device="cuda")
+
+    jit_kernel(_bf16_dot_probe_triton)[(1,)](q, k, out, channels=channels)
+
+    assert torch.equal(out, torch.full_like(out, 6)), out
+
+
+@pytest.mark.gpu_triton
 @pytest.mark.parametrize("length", [7, 131])
 @pytest.mark.parametrize("high_tail", [False, True])
+@pytest.mark.parametrize("channels", [16, 32, 64])
 def test_known_nonuniform_logits_weight_the_final_rows(
     length: int,
     high_tail: bool,
+    channels: int,
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("needs a CUDA device")
-    q = torch.zeros(2, 5, 3, 16, dtype=torch.bfloat16, device="cuda")
+    q = torch.zeros(2, 5, 3, channels, dtype=torch.bfloat16, device="cuda")
     q[..., 0] = 1
-    keys = torch.zeros(2, length, 3, 16, dtype=torch.bfloat16, device="cuda")
+    keys = torch.zeros(2, length, 3, channels, dtype=torch.bfloat16, device="cuda")
     keys[..., 1] = 6
     keys[:, -3:, :, 0] = 6 if high_tail else 0
     keys[:, :-3, :, 0] = 0 if high_tail else 6
     values = torch.zeros_like(keys)
     values[:, -3:] = 1
-    tail = 3 * (math.exp(1.5) if high_tail else 1)
-    prefix = (length - 3) * (1 if high_tail else math.exp(1.5))
+    tail = 3 * (math.exp(6 * channels**-0.5) if high_tail else 1)
+    prefix = (length - 3) * (1 if high_tail else math.exp(6 * channels**-0.5))
     expected = torch.full_like(q, tail / (prefix + tail))
 
     actual = Fp4TritonAttention.Config().make()(q, _quantize(keys), _quantize(values))
@@ -439,6 +462,21 @@ def _cuda_case(
         ),
     )
     return q, k, v
+
+
+def _bf16_dot_probe_triton(
+    q_ptr: language.tensor,
+    k_ptr: language.tensor,
+    out_ptr: language.tensor,
+    channels: language.constexpr,
+) -> None:
+    rows = language.arange(0, 16)
+    cols = language.arange(0, 32)
+    width = language.arange(0, channels)
+    q = language.load(q_ptr + rows[:, None] * channels + width[None, :])
+    k = language.load(k_ptr + width[:, None] * 32 + cols[None, :])
+    out = language.dot(q, k)
+    language.store(out_ptr + rows[:, None] * 32 + cols[None, :], out)
 
 
 def _reference(
