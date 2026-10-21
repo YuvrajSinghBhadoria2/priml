@@ -11,6 +11,13 @@ approximately 1099, 746, and 646 decode tokens/sec, with 4096, 2176, and
 slower. Raw timing artifacts for those measurements are not included.
 The scale-range fixes have not been benchmarked on that A100.
 
+`exp003` gives packed FP4 rows directly to a Triton attention kernel. Its
+author-reported 690.6-692.1 tokens/sec remains unverified; raw timing artifacts
+and profiler traces are unavailable. Its cache occupies 1152 bytes per token,
+or 36 MiB for batch 8 at context 4096, matching `exp002`. GQA expansion and
+scale clones remain in this path. The timings do not establish which cost
+dominates or whether decode is limited by CPU launches or memory traffic.
+
 For a paired run, save the following as `paired.py` in your development
 checkout. Every factory keeps its default `seed=None`; this comparison
 explicitly selects the reported seed, 20261021, for all three runs.
@@ -63,3 +70,8 @@ attention, and recurrent delta state. Direct cache updates use a four-byte
 float32 scale per row; the module docstrings state its finite range and
 saturation behavior. FP4 midpoint ties choose the lower magnitude; this is
 an E2M1-grid quantizer rather than a complete MX-compliant converter.
+
+`fp4_fused_layer_cache` supports ordinary `Attention`, including GQA, only.
+Its kernel requires bf16 queries and head widths and key tiles that are powers
+of two of at least 16. Triton is loaded when the fused kernel is first used;
+importing or inspecting experiment configs does not require it.

@@ -218,8 +218,9 @@ def exp003() -> DecodeBenchmark.Config:
     through a 16-entry table in registers, scales by the row's float32 scale,
     and attends -- the dequantized cache-sized copy exp001 and exp002
     materialize every step is never written. The model, its dtype, the
-    prompts, the context length, the cache bytes, and the harness are
-    exp000's; only the read path differs from exp002.
+    prompts, the context length, and the harness are exp000's. Cache storage
+    matches exp002: 1152 bytes per token, versus exp000's 4096. The allocator
+    and the kernel consuming its packed rows differ from exp002.
 
     Hypothesis:
       exp002's −41% is the dequantized copy, not the codes: with the
@@ -241,23 +242,26 @@ def exp003() -> DecodeBenchmark.Config:
         experiment rung rather than a core-model change.
 
     Results:
-      2026-10-21, same A100 box, seed 20261021, two runs: exp003 690.6-692.1
+      AUTHOR-REPORTED / UNVERIFIED: 2026-10-21, same A100 box, seed 20261021,
+      two runs: exp003 690.6-692.1
       tokens/sec, p99 13.9 ms, kv 37748736 bytes -- against that session's
       exp000 1068.8-1070.9 and exp002 634.8-638.6. FAILURE by the frozen
       rule: fusion beats exp002 by 8.6% and cuts p99, but lands below
-      exp001 and recovers only ~13% of the gap to exp000, so the
-      dequantized copy was not the dominant per-step cost. Kernel output
-      matches the materialized path to bf16 rounding (max abs diff 0.00195
-      against SDPA over _dequantized rows under the ladder's masks).
-      A follow-up probe removed the GQA head expansion as well
+      exp001 and recovers only ~13% of the gap to exp000. The author also
+      reported max abs kernel-output difference 0.00195 against SDPA over
+      _dequantized rows under the ladder's masks.
+      A follow-up probe changed the head counts
       (``num_heads_kv = 8``, ``kv_groups = 1``, same seed): 703.4-705.9
       tokens/sec -- +1.9% over exp003, still ~36% under exp000's same-
-      session 1106-1109. Both candidate read-path costs are therefore
-      exonerated: at this batch and model size the step is CPU/launch-bound
-      (per-step KV reads are only ``bytes/token x context`` -- single-digit
-      MB -- against 45 MB of weights), and the gap is what the quantized
-      write path costs the CPU: the per-step pack kernels, tensor reshapes,
-      and their launches, none of which any read-path change can remove.
+      session 1106-1109. Raw timing artifacts and a profiler trace are not
+      included, and these results have not been reproduced after the fixes.
+      The timings do not isolate a dominant cost or establish a CPU/launch
+      bottleneck. Packed storage is 1152 * 4096 * 8 = 37748736 bytes (36 MiB)
+      for the batch at full context, before GQA expansion and scale clones;
+      allocated bytes are not measured memory traffic. The current path
+      still expands packed GQA heads and clones scales into float32 tensors.
+      Read traffic, quantized writes, and launch overhead remain hypotheses
+      requiring profiling and controlled comparisons.
 
     Returns:
       config: exp000 with the packed-served fp4 cache and the fused Triton
@@ -270,5 +274,5 @@ def exp003() -> DecodeBenchmark.Config:
     assert isinstance(block, TransformerBlock.Config)
     attn = block.attn
     assert isinstance(attn, Attention.Config)
-    attn.attn_kernel = Fp4TritonAttention.Config(channels_head=64)
+    attn.attn_kernel = Fp4TritonAttention.Config()
     return cfg

@@ -11,9 +11,9 @@ materialized as a cache-sized bf16 tensor.
 The kernel's arithmetic matches :func:`~priml.baselines.kvcache.fp4._dequantized`
 per value (float32 table and scale, rounded to the incoming dtype before the
 dot), so logits differ from the materialized path only by execution order.
-It is an experiment kernel: dropout, windows, and explicit masks are refused,
-and odd channel counts are rejected (the frozen decode ladder is even-width,
-full-context, and maskless on decode).
+It is an experiment kernel: dropout, windows, and explicit masks are refused.
+Head widths and key tiles must be powers of two of at least 16, as required
+by the Triton dot products.
 """
 
 from __future__ import annotations
@@ -23,20 +23,24 @@ from typing import TYPE_CHECKING, override
 
 from configgle import Fig
 from torch import Tensor, nn
-from triton import language
 
 import torch
 
 from priml.baselines.kvcache.fp4 import (
     _CODE_VALUES,
+    SCALE_COLUMNS,
     FP4KVCache,
 )
 from priml.kernel import jit_kernel, require_power_of_two
+from priml.model.attention.attention import Attention
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.attention.kvcache import KVCache, alloc_layer_cache
+from priml.model.custom_types import is_cached_attention
 
 
 if TYPE_CHECKING:
+    from triton import language
+
     import triton
 
     from priml.cost import Cost
@@ -46,6 +50,7 @@ else:
     from wrapt import lazy_import
 
     triton = lazy_import("triton")
+    language = lazy_import("triton.language")
 
 
 __all__ = [
@@ -53,120 +58,6 @@ __all__ = [
     "Fp4TritonAttention",
     "fp4_fused_layer_cache",
 ]
-
-
-_SCALE_CODE_BYTES = 4
-"""Bytes of float32 scale that trail a packed row; matches fp4.SCALE_COLUMNS."""
-
-
-@jit_kernel
-def _fp4_attention_forward(  # noqa: PLR0917 -- The signature is the kernel's positional ABI.
-    q_ptr: language.tensor,
-    k_ptr: language.tensor,
-    v_ptr: language.tensor,
-    ks_ptr: language.tensor,
-    vs_ptr: language.tensor,
-    out_ptr: language.tensor,
-    table_ptr: language.tensor,
-    q_b: int,
-    q_s: int,
-    q_h: int,
-    k_b: int,
-    k_h: int,
-    k_l: int,
-    v_b: int,
-    v_h: int,
-    v_l: int,
-    ks_b: int,
-    ks_h: int,
-    ks_l: int,
-    vs_b: int,
-    vs_h: int,
-    vs_l: int,
-    out_b: int,
-    out_s: int,
-    out_h: int,
-    heads: language.constexpr,
-    seq: language.constexpr,
-    length: int,
-    channels: language.constexpr,
-    code_width: language.constexpr,
-    block_l: language.constexpr,
-    block_s: language.constexpr,
-    causal: language.constexpr,
-    logit_scale: language.constexpr,
-) -> None:
-    """One program per (batch, query head): stream keys, online softmax."""
-    pid = language.program_id(0)
-    b = pid // heads
-    h = pid - b * heads
-    s = language.arange(0, block_s)
-    d = language.arange(0, channels)
-    q = language.load(
-        q_ptr + b * q_b + s[:, None] * q_s + h * q_h + d,
-        mask=(s < seq)[:, None],
-        other=0.0,
-    )
-    acc = language.zeros((block_s, channels), dtype=language.float32)
-    m = language.full((block_s,), float("-inf"), dtype=language.float32)
-    lse = language.zeros((block_s,), dtype=language.float32)
-    lc = language.arange(0, block_l)
-    wc = language.arange(0, code_width)
-    for start in range(0, length, block_l):
-        j = start + lc
-        valid = j < length
-        codes = language.load(
-            k_ptr + b * k_b + h * k_h + j[:, None] * k_l + wc,
-            mask=valid[:, None],
-            other=0,
-        )
-        high = language.load(table_ptr + (codes.to(language.int32) >> 4))
-        low = language.load(table_ptr + (codes.to(language.int32) & 15))
-        key = language.reshape(language.join(high, low), block_l, channels)
-        scale = language.load(
-            ks_ptr + b * ks_b + h * ks_h + j * ks_l,
-            mask=valid,
-            other=1.0,
-        )
-        key = (key.to(language.float32) * scale[:, None]).to(language.bfloat16)
-        logits = language.dot(q, language.trans(key)) * logit_scale
-        if causal:
-            query_pos = (length - seq) + s[:, None]
-            logits = language.where(j[None, :] <= query_pos, logits, float("-inf"))
-        logits = language.where(valid[None, :], logits, float("-inf"))
-        m_new = language.maximum(m, language.max(logits, 1))
-        alpha = language.exp(m - m_new)
-        p = language.exp(logits - m_new[:, None])
-        acc = acc * alpha[:, None]
-        vcodes = language.load(
-            v_ptr + b * v_b + h * v_h + j[:, None] * v_l + wc,
-            mask=valid[:, None],
-            other=0,
-        )
-        vhigh = language.load(table_ptr + (vcodes.to(language.int32) >> 4))
-        vlow = language.load(table_ptr + (vcodes.to(language.int32) & 15))
-        value = language.reshape(language.join(vhigh, vlow), block_l, channels)
-        vscale = language.load(
-            vs_ptr + b * vs_b + h * vs_h + j * vs_l,
-            mask=valid,
-            other=1.0,
-        )
-        value = (value.to(language.float32) * vscale[:, None]).to(language.bfloat16)
-        acc += language.dot(p.to(language.bfloat16), value)
-        lse = lse * alpha + language.sum(p, 1)
-        m = m_new
-    out = acc / lse[:, None]
-    language.store(
-        out_ptr + b * out_b + s[:, None] * out_s + h * out_h + d,
-        out,
-        mask=(s < seq)[:, None],
-    )
-
-
-@lru_cache(maxsize=8)
-def _code_table(device: torch.device) -> Tensor:
-    """Return the 16 signed e2m1 values as a bf16 lookup row, once per device."""
-    return torch.tensor(_CODE_VALUES, device=device, dtype=torch.bfloat16)
 
 
 class Fp4TritonAttention(nn.Module):
@@ -179,11 +70,8 @@ class Fp4TritonAttention(nn.Module):
     """
 
     class Config(Fig["Fp4TritonAttention"]):
-        channels_head: int = -1
-        """Query/key width per head; must be even (two codes per byte)."""
-
         block_l: int = 128
-        """Keys streamed per loop iteration; a power of two."""
+        """Keys streamed per loop iteration; a power of two of at least 16."""
 
         @classmethod
         def cost(
@@ -235,13 +123,9 @@ class Fp4TritonAttention(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        if config.channels_head % 2:
-            raise ValueError(
-                f"channels_head={config.channels_head} must be even; two e2m1 "
-                "codes ride in one byte.",
-            )
         require_power_of_two(block_l=config.block_l)
-        self.channels_head = config.channels_head
+        if config.block_l < 16:
+            raise ValueError(f"block_l must be at least 16; got {config.block_l}.")
         self.block_l = config.block_l
 
     @override
@@ -296,14 +180,14 @@ class Fp4TritonAttention(nn.Module):
             )
         batch, seq, heads, channels = q.shape
         length = k.shape[1]
-        if (
-            channels != self.channels_head
-            or k.shape[-1] != channels // 2 + _SCALE_CODE_BYTES
-        ):
+        if channels < 16 or channels & (channels - 1):
+            raise ValueError(
+                f"Query channels must be a power of two of at least 16; got {channels}.",
+            )
+        if k.shape[-1] != channels // 2 + SCALE_COLUMNS:
             raise ValueError(
                 f"Queries carry {channels} channels over packed width "
-                f"{k.shape[-1]}; this kernel was built for "
-                f"{self.channels_head} + {_SCALE_CODE_BYTES}.",
+                f"{k.shape[-1]}; expected {channels // 2 + SCALE_COLUMNS}.",
             )
         if k.shape != v.shape or k.shape[:2] != (batch, length) or k.shape[2] != heads:
             raise ValueError(
@@ -333,7 +217,7 @@ class Fp4TritonAttention(nn.Module):
         out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
         table = _code_table(q.device)
         block_s = max(16, 1 << (seq - 1).bit_length())
-        _fp4_attention_forward[(batch * heads,)](
+        _compiled_fp4_attention()[(batch * heads,)](
             q,
             k,
             v,
@@ -344,6 +228,7 @@ class Fp4TritonAttention(nn.Module):
             q_b=q.stride(0),
             q_s=q.stride(1),
             q_h=q.stride(2),
+            q_d=q.stride(3),
             k_b=k.stride(0),
             k_h=k.stride(1),
             k_l=k.stride(2),
@@ -368,6 +253,7 @@ class Fp4TritonAttention(nn.Module):
             block_s=block_s,
             causal=is_causal,
             logit_scale=channels**-0.5 if scale is None else scale,
+            value_limit=torch.finfo(q.dtype).max,
         )
         return out.to(q.dtype)
 
@@ -391,7 +277,9 @@ def fp4_fused_layer_cache(
 ) -> dict[DepthIndex, object]:
     """Allocate one :class:`FP4PackedKVCache` per cached attention.
 
-    Same contract as :func:`fp4_layer_cache`; only the served slice differs.
+    Supports ordinary :class:`Attention`, including GQA. Other cached
+    families inspect storage geometry, use recurrent state, or consume the
+    latent with float tensor operations, so they cannot use these packed rows.
 
     Args:
       model: Module tree containing cached attentions.
@@ -404,8 +292,17 @@ def fp4_fused_layer_cache(
     Returns:
       cache: Mutable state keyed by each attention's full depth index.
 
+    Raises:
+      TypeError: The model contains an unsupported cached attention family.
+
     """
     del dtype
+    for module in model.modules():
+        if is_cached_attention(module) and not isinstance(module, Attention):
+            raise TypeError(
+                f"Cached attention {type(module).__name__} is not supported by "
+                "fp4_fused_layer_cache; supported family is Attention (including GQA).",
+            )
     result: dict[DepthIndex, object] = {}
     allocated = alloc_layer_cache(
         model,
@@ -424,3 +321,127 @@ def fp4_fused_layer_cache(
             device=state.k.device,
         )
     return result
+
+
+@lru_cache(maxsize=1)
+def _compiled_fp4_attention() -> triton.JITFunction[..., object]:
+    return jit_kernel(_fp4_attention_forward_triton)
+
+
+def _fp4_attention_forward_triton(  # noqa: PLR0917 -- The signature is the kernel's positional ABI.
+    q_ptr: language.tensor,
+    k_ptr: language.tensor,
+    v_ptr: language.tensor,
+    ks_ptr: language.tensor,
+    vs_ptr: language.tensor,
+    out_ptr: language.tensor,
+    table_ptr: language.tensor,
+    q_b: int,
+    q_s: int,
+    q_h: int,
+    q_d: int,
+    k_b: int,
+    k_h: int,
+    k_l: int,
+    v_b: int,
+    v_h: int,
+    v_l: int,
+    ks_b: int,
+    ks_h: int,
+    ks_l: int,
+    vs_b: int,
+    vs_h: int,
+    vs_l: int,
+    out_b: int,
+    out_s: int,
+    out_h: int,
+    heads: language.constexpr,
+    seq: language.constexpr,
+    length: int,
+    channels: language.constexpr,
+    code_width: language.constexpr,
+    block_l: language.constexpr,
+    block_s: language.constexpr,
+    causal: language.constexpr,
+    logit_scale: language.constexpr,
+    value_limit: language.constexpr,
+) -> None:
+    """One program per (batch, query head): stream keys, online softmax."""
+    pid = language.program_id(0)
+    b = pid // heads
+    h = pid - b * heads
+    s = language.arange(0, block_s)
+    d = language.arange(0, channels)
+    q = language.load(
+        q_ptr + b * q_b + s[:, None] * q_s + h * q_h + d * q_d,
+        mask=(s < seq)[:, None],
+        other=0.0,
+    )
+    acc = language.zeros((block_s, channels), dtype=language.float32)
+    m = language.full((block_s,), float("-inf"), dtype=language.float32)
+    lse = language.zeros((block_s,), dtype=language.float32)
+    lc = language.arange(0, block_l)
+    wc = language.arange(0, code_width)
+    for start in range(0, length, block_l):
+        j = start + lc
+        valid = j < length
+        codes = language.load(
+            k_ptr + b * k_b + h * k_h + j[:, None] * k_l + wc,
+            mask=valid[:, None],
+            other=0,
+        )
+        high = language.load(table_ptr + (codes.to(language.int32) >> 4))
+        low = language.load(table_ptr + (codes.to(language.int32) & 15))
+        key = language.reshape(language.join(high, low), block_l, channels)
+        scale = language.load(
+            ks_ptr + b * ks_b + h * ks_h + j * ks_l,
+            mask=valid,
+            other=1.0,
+        )
+        key = language.clamp(
+            key.to(language.float32) * scale[:, None],
+            -value_limit,
+            value_limit,
+        ).to(language.bfloat16)
+        logits = language.dot(q, language.trans(key)) * logit_scale
+        if causal:
+            query_pos = (length - seq) + s[:, None]
+            logits = language.where(j[None, :] <= query_pos, logits, float("-inf"))
+        logits = language.where(valid[None, :], logits, float("-inf"))
+        m_new = language.maximum(m, language.max(logits, 1))
+        alpha = language.exp(m - m_new)
+        p = language.exp(logits - m_new[:, None])
+        acc = acc * alpha[:, None]
+        vcodes = language.load(
+            v_ptr + b * v_b + h * v_h + j[:, None] * v_l + wc,
+            mask=valid[:, None],
+            other=0,
+        )
+        vhigh = language.load(table_ptr + (vcodes.to(language.int32) >> 4))
+        vlow = language.load(table_ptr + (vcodes.to(language.int32) & 15))
+        value = language.reshape(language.join(vhigh, vlow), block_l, channels)
+        vscale = language.load(
+            vs_ptr + b * vs_b + h * vs_h + j * vs_l,
+            mask=valid,
+            other=1.0,
+        )
+        value = language.clamp(
+            value.to(language.float32) * vscale[:, None],
+            -value_limit,
+            value_limit,
+        ).to(language.bfloat16)
+        acc += language.dot(p.to(language.bfloat16), value)
+        lse = lse * alpha + language.sum(p, 1)
+        m = m_new
+    out = acc / lse[:, None]
+    language.store(
+        out_ptr + b * out_b + s[:, None] * out_s + h * out_h + d,
+        out,
+        mask=(s < seq)[:, None],
+    )
+
+
+@lru_cache(maxsize=8)
+def _code_table(device: torch.device) -> Tensor:
+    """Return the 16 signed e2m1 values as a bf16 lookup row, once per device."""
+    return torch.tensor(_CODE_VALUES, device=device, dtype=torch.bfloat16)
