@@ -104,8 +104,12 @@ class Transformer(nn.Module):
             block_configs: list[ChannelsInOutConfig] = []
             for index, template in enumerate(templates):
                 config = template.copy_tree()
-                if isinstance(config, HasDepthIndex):
-                    config.depth_index = ((index, self.num_layers),)
+                propagate_attr(
+                    config,
+                    "depth_index",
+                    ((index, self.num_layers),),
+                    protocol=HasDepthIndex,
+                )
                 block_configs.append(config)
             self.block = block_configs
             for config in block_configs:

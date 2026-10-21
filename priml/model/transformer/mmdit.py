@@ -50,6 +50,7 @@ from priml.model.custom_types import (
 )
 from priml.model.linear import Linear
 from priml.model.norm import LayerNorm
+from priml.model.passthrough import attribute_target
 from priml.model.swiglu import SwiGLU
 
 
@@ -236,8 +237,9 @@ class MMDiTStream(nn.Module):
                     child.channels_in = self.channels_in  # pyrefly: ignore[attribute-assign-on-never] -- pyrefly narrows isinstance(Optional, Protocol) to Never.
                 if isinstance(child, ChannelsOut) and child.channels_out == -1:
                     child.channels_out = self.channels_in  # pyrefly: ignore[attribute-assign-on-never] -- pyrefly narrows isinstance(Optional, Protocol) to Never.
-                if isinstance(child, HasDepthIndex) and not child.depth_index:
-                    child.depth_index = self.depth_index  # pyrefly: ignore[attribute-assign-on-never] -- pyrefly narrows isinstance(Optional, Protocol) to Never.
+                target = attribute_target(child, "depth_index")
+                if isinstance(target, HasDepthIndex) and not target.depth_index:
+                    target.depth_index = self.depth_index
             return super().finalize()
 
         def cost(

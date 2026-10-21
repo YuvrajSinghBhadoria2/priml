@@ -19,6 +19,7 @@ from torch import Tensor, nn
 import torch
 
 from priml.math.custom_types import TensorFn
+from priml.model.passthrough import attribute_target
 
 
 if TYPE_CHECKING:
@@ -666,8 +667,7 @@ def propagate_attr(
     does not implement ``protocol`` legitimately opts out and is skipped.
 
     A participating attribute is assigned normally. Transparent Config wrappers
-    may explicitly inherit the runtime Protocol while delegating reads and writes
-    through their passthrough mixin.
+    participate according to the target receiving that attribute's writes.
 
     Args:
       config: Child config to mutate.
@@ -682,9 +682,13 @@ def propagate_attr(
         attribute at all -- a typo or a misdeclared field.
 
     """
-    participates = protocol is None or isinstance(config, protocol)
+    if protocol is not None and not isinstance(
+        attribute_target(config, name),
+        protocol,
+    ):
+        return
     if not hasattr(config, name):
-        if not participates or protocol is None:
+        if protocol is None:
             return
         raise AttributeError(
             f"{type(config).__name__} satisfies {protocol.__name__} but has "

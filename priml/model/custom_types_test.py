@@ -17,6 +17,7 @@ from priml.model.attention.attention import Attention
 from priml.model.custom_types import (
     AttentionKernel,
     ChannelsIn,
+    ChannelsInOut,
     ChannelsOut,
     HasResetParameters,
     LatentAttentionKernel,
@@ -134,6 +135,18 @@ def test_propagate_non_participant_skipped():
     propagate_attr(cfg, "channels_out", 999, protocol=ChannelsOut)
     propagate_attr(cfg, "depth_index", ((0, 1),))
     assert not hasattr(cfg, "channels_out")
+
+
+def test_propagate_existing_attribute_requires_the_complete_protocol() -> None:
+    config = SoftmaxRouter.Config()
+    config.channels_in = 4
+    assert not isinstance(config, ChannelsInOut)
+
+    propagate_attr(config, "channels_in", 16, protocol=ChannelsInOut)
+
+    assert config.channels_in == 4
+    propagate_attr(config, "channels_in", 16, protocol=ChannelsIn)
+    assert config.channels_in == 16
 
 
 def test_propagate_norm_width_is_mutable_but_checked_at_construction():
